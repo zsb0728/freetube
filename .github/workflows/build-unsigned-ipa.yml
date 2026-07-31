@@ -1,0 +1,98 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: Bundle ID used before re-signing
+        required: true
+        default: com.leshko.freetube
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      PROJECT: FreeTube/FreeTube.xcodeproj
+      SCHEME: FreeTube
+      BUNDLE_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.bundle_id || 'com.leshko.freetube' }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          swift --version
+          xcodebuild -project "$PROJECT" -list
+
+      - name: Resolve Swift packages
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project "$PROJECT" \
+            -scheme "$SCHEME"
+
+      - name: Build device app without signing
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            clean build
+
+      - name: Package unsigned IPA
+        id: package
+        run: |
+          set -euxo pipefail
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/FreeTube.app"
+          test -d "$APP"
+
+          rm -rf "$RUNNER_TEMP/Payload" "$GITHUB_WORKSPACE/dist"
+          mkdir -p "$RUNNER_TEMP/Payload" "$GITHUB_WORKSPACE/dist"
+          cp -R "$APP" "$RUNNER_TEMP/Payload/"
+          xattr -cr "$RUNNER_TEMP/Payload"
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IPA="$GITHUB_WORKSPACE/dist/FreeTube-unsigned-${SHORT_SHA}.ipa"
+          cd "$RUNNER_TEMP"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload "$IPA"
+
+          shasum -a 256 "$IPA" > "${IPA}.sha256"
+          unzip -t "$IPA"
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeTube-unsigned-${{ github.run_number }}
+          path: |
+            dist/*.ipa
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
