@@ -1,0 +1,94 @@
+name: Simulator Launch Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select and boot iPhone simulator
+        run: |
+          set -euxo pipefail
+          xcodebuild -version
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d=json.load(sys.stdin)
+          for runtime, devices in d["devices"].items():
+              if "iOS" not in runtime: continue
+              for x in devices:
+                  if "iPhone" in x["name"]:
+                      print(x["udid"]); raise SystemExit
+          raise SystemExit("No available iPhone simulator")')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          open -a Simulator --args -CurrentDeviceUDID "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Build simulator app
+        run: |
+          set -euxo pipefail
+          xcodebuild \
+            -project FreeTube/FreeTube.xcodeproj \
+            -scheme FreeTube \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination "id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            ENABLE_DEBUG_DYLIB=NO \
+            ENABLE_PREVIEWS=NO \
+            ENABLE_TESTABILITY=NO \
+            SWIFT_OPTIMIZATION_LEVEL=-O \
+            clean build
+
+      - name: Install, launch, and collect logs
+        run: |
+          set -uxo pipefail
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphonesimulator/FreeTube.app"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl install "$UDID" "$APP"
+
+          rm -f "$RUNNER_TEMP/launch.log"
+          xcrun simctl spawn "$UDID" log stream \
+            --style compact \
+            --level debug \
+            --predicate "process == 'FreeTube' OR eventMessage CONTAINS[c] '$BUNDLE_ID'" \
+            > "$RUNNER_TEMP/launch.log" 2>&1 &
+          LOG_PID=$!
+
+          xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE_ID" | tee "$RUNNER_TEMP/launch-result.txt"
+          sleep 12
+          xcrun simctl io "$UDID" screenshot "$RUNNER_TEMP/FreeTube-simulator.png" || true
+          xcrun simctl spawn "$UDID" log show --last 2m --style compact \
+            --predicate "process == 'FreeTube' OR eventMessage CONTAINS[c] '$BUNDLE_ID'" \
+            > "$RUNNER_TEMP/log-show.txt" 2>&1 || true
+          kill "$LOG_PID" 2>/dev/null || true
+
+          cat "$RUNNER_TEMP/launch.log" || true
+          echo '--- Recent log ---'
+          cat "$RUNNER_TEMP/log-show.txt" || true
+
+          if grep -Eiq 'crash|abort|fatal error|dyld.*error|termination reason|uncaught exception' "$RUNNER_TEMP/launch.log" "$RUNNER_TEMP/log-show.txt"; then
+            echo 'Detected launch failure' >&2
+            exit 1
+          fi
+
+      - name: Upload diagnostic files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-launch-diagnostic-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/launch.log
+            ${{ runner.temp }}/launch-result.txt
+            ${{ runner.temp }}/log-show.txt
+            ${{ runner.temp }}/FreeTube-simulator.png
+          if-no-files-found: warn
+          retention-days: 7
