@@ -63,7 +63,29 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
             PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            ENABLE_DEBUG_DYLIB=NO \
+            ENABLE_PREVIEWS=NO \
+            ENABLE_TESTABILITY=NO \
+            SWIFT_OPTIMIZATION_LEVEL=-O \
+            DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
             clean build
+
+      - name: Validate re-signable app bundle
+        run: |
+          set -euxo pipefail
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/FreeTube.app"
+          test -d "$APP"
+          test -f "$APP/FreeTube"
+          test ! -e "$APP/FreeTube.debug.dylib"
+          test ! -e "$APP/__preview.dylib"
+          ! otool -L "$APP/FreeTube" | grep -E 'debug\.dylib|__preview\.dylib'
+
+          # Report every nested Mach-O component that a signing tool must sign.
+          find "$APP" -type f -print0 | while IFS= read -r -d '' file; do
+            if file "$file" | grep -q 'Mach-O'; then
+              echo "Mach-O: ${file#$APP/}"
+            fi
+          done
 
       - name: Package unsigned IPA
         id: package
