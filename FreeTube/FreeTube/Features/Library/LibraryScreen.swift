@@ -18,6 +18,7 @@ struct LibraryScreen: View {
     @State private var libraryModel = LibraryViewModel()
     @State private var accountModel = AccountViewModel()
     @State private var showingLogin = false
+    @State private var authState = AuthState.shared
 
     var body: some View {
         NavigationStack {
@@ -82,6 +83,30 @@ struct LibraryScreen: View {
                     }
                     .buttonStyle(.bordered)
                 }
+            } else if case .loggedIn = authState.status {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("YouTube session active", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Your login cookies are saved. Account details could not be loaded yet, but native playback will still retry with this session.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Button("Refresh account") {
+                            Task {
+                                await accountModel.load()
+                                if accountModel.info != nil { await libraryModel.load() }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        Button("Sign out", role: .destructive) {
+                            Task {
+                                await accountModel.signOut()
+                                libraryModel.clear()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
             } else {
                 Button {
                     showingLogin = true
@@ -91,7 +116,11 @@ struct LibraryScreen: View {
             }
         } footer: {
             if accountModel.info == nil {
-                Text("Sign in to access your watch history, playlists, liked videos, and Watch Later.")
+                if case .loggedIn = authState.status {
+                    Text("Session saved; account metadata is temporarily unavailable.")
+                } else {
+                    Text("Sign in to access your watch history, playlists, liked videos, and Watch Later.")
+                }
             }
         }
     }

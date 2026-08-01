@@ -60,7 +60,9 @@ final class VideoService: VideoServicing {
             return info
         } catch {
             log.error("fetchInfo[IOS] FAILED id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
-            await Self.clearSessionIfLoginRequired(error)
+            // A player endpoint may return LOGIN_REQUIRED for one video because of PoToken,
+            // bot verification, age, region, or client policy. That is not proof that the user's
+            // account cookies expired. Never destroy the global session from a playback error.
             throw YouTubeServiceError.network(error)
         }
     }
@@ -85,71 +87,85 @@ final class VideoService: VideoServicing {
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL {
         log.info("fetchAndroidProgressiveURL start id=\(id, privacy: .public)")
         let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(
-            "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
-            forHTTPHeaderField: "User-Agent"
-        )
-        let cookies = client.cookies
-        if !cookies.isEmpty {
-            request.setValue(cookies, forHTTPHeaderField: "Cookie")
-            request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
-            request.setValue("https://www.youtube.com", forHTTPHeaderField: "X-Origin")
-            request.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
-            if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
-                request.setValue(authorization, forHTTPHeaderField: "Authorization")
-            }
-        }
-        let body: [String: Any] = [
-            "context": [
-                "client": [
-                    "clientName": "ANDROID",
-                    "clientVersion": "21.26.364",
-                    "androidSdkVersion": 30,
-                    "userAgent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
-                    "osName": "Android",
-                    "osVersion": "11"
-                ]
-            ],
-            "videoId": id,
-            "contentCheckOk": true,
-            "racyCheckOk": true
+        let userAgent = "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
+        let androidClient: [String: Any] = [
+            "clientName": "ANDROID",
+            "clientVersion": "21.26.364",
+            "androidSdkVersion": 30,
+            "userAgent": userAgent,
+            "osName": "Android",
+            "osVersion": "11"
         ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let mwebClient: [String: Any] = [
+            "clientName": "MWEB",
+            "clientVersion": "2.20260708.05.00",
+            "userAgent": "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)"
+        ]
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode),
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw YouTubeServiceError.streamExtractionFailed
+        func request(clientContext: [String: Any], label: String, useAuthentication: Bool) async throws -> URL? {
+            let body: [String: Any] = [
+                "context": ["client": clientContext],
+                "videoId": id,
+                "contentCheckOk": true,
+                "racyCheckOk": true
+            ]
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+            let cookies = client.cookies
+            if useAuthentication, !cookies.isEmpty {
+                request.setValue(cookies, forHTTPHeaderField: "Cookie")
+                request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+                request.setValue("https://www.youtube.com", forHTTPHeaderField: "X-Origin")
+                request.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
+                if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
+                    request.setValue(authorization, forHTTPHeaderField: "Authorization")
+                }
+            }
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            if let playability = json["playabilityStatus"] as? [String: Any],
+               let status = playability["status"] as? String,
+               status != "OK" {
+                log.notice("\(label, privacy: .public) client auth=\(useAuthentication, privacy: .public) playability=\(status, privacy: .public)")
+                return nil
+            }
+            guard let streaming = json["streamingData"] as? [String: Any],
+                  let rawFormats = streaming["formats"] as? [[String: Any]] else {
+                return nil
+            }
+            let candidates: [(url: URL, height: Int)] = rawFormats.compactMap { format in
+                guard let mime = format["mimeType"] as? String,
+                      mime.lowercased().contains("video/mp4"),
+                      mime.lowercased().contains("mp4a"),
+                      let urlString = format["url"] as? String,
+                      let url = URL(string: urlString) else { return nil }
+                let height = format["height"] as? Int ?? 0
+                guard height <= maxHeight || maxHeight <= 0 else { return nil }
+                return (url, height)
+            }
+            guard let best = candidates.max(by: { $0.height < $1.height }) else { return nil }
+            log.info("\(label, privacy: .public) client auth=\(useAuthentication, privacy: .public) selected muxed MP4 height=\(best.height, privacy: .public)")
+            return best.url
         }
-        if let playability = json["playabilityStatus"] as? [String: Any],
-           let status = playability["status"] as? String,
-           status != "OK" {
-            log.notice("Android client playability=\(status, privacy: .public)")
-            throw YouTubeServiceError.streamExtractionFailed
+
+        // Public videos should not be poisoned by stale or partially accepted account cookies.
+        // Rotate between two native clients, then retry both with the saved authenticated session.
+        if let url = try await request(clientContext: androidClient, label: "ANDROID", useAuthentication: false) { return url }
+        if let url = try await request(clientContext: mwebClient, label: "MWEB", useAuthentication: false) { return url }
+        if !client.cookies.isEmpty {
+            if let url = try await request(clientContext: mwebClient, label: "MWEB", useAuthentication: true) { return url }
+            if let url = try await request(clientContext: androidClient, label: "ANDROID", useAuthentication: true) { return url }
         }
-        guard let streaming = json["streamingData"] as? [String: Any],
-              let rawFormats = streaming["formats"] as? [[String: Any]] else {
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        let candidates: [(url: URL, height: Int)] = rawFormats.compactMap { format in
-            guard let mime = format["mimeType"] as? String,
-                  mime.lowercased().contains("video/mp4"),
-                  mime.lowercased().contains("mp4a"),
-                  let urlString = format["url"] as? String,
-                  let url = URL(string: urlString) else { return nil }
-            let height = format["height"] as? Int ?? 0
-            guard height <= maxHeight || maxHeight <= 0 else { return nil }
-            return (url, height)
-        }
-        guard let best = candidates.max(by: { $0.height < $1.height }) else {
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        log.info("Android client selected muxed MP4 height=\(best.height, privacy: .public)")
-        return best.url
+        throw YouTubeServiceError.streamExtractionFailed
     }
 
     func fetchInfoWithFormats(id: String) async throws -> VideoInfoWithFormats {
@@ -164,7 +180,8 @@ final class VideoService: VideoServicing {
             return VideoInfoWithFormats(info: info, formats: formats)
         } catch {
             log.error("VideoInfosWithDownloadFormatsResponse failed: \(String(describing: error), privacy: .public)")
-            await Self.clearSessionIfLoginRequired(error)
+            // Stream extraction failure must not sign the user out; account validity is checked
+            // only by authenticated account endpoints.
             throw YouTubeServiceError.streamExtractionFailed
         }
     }
@@ -205,18 +222,6 @@ final class VideoService: VideoServicing {
         } catch {
             throw YouTubeServiceError.network(error)
         }
-    }
-
-    // MARK: - Cookie hygiene
-
-    /// If the failure looks like YouTube rejecting a stale auth blob, wipe the cookies in Keychain
-    /// + `YouTubeModel`. The next user attempt will run anonymously and should succeed. We catch
-    /// `LOGIN_REQUIRED` and `UNPLAYABLE` strings emitted by `VideoInfosResponse.decodeJSON`'s guards.
-    private static func clearSessionIfLoginRequired(_ error: Error) async {
-        let description = String(describing: error)
-        let signals = ["LOGIN_REQUIRED", "Login is required", "UNPLAYABLE"]
-        guard signals.contains(where: { description.localizedCaseInsensitiveContains($0) }) else { return }
-        await SessionManager.shared.handleExpiredSession()
     }
 
     // MARK: - Mapping helpers
