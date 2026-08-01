@@ -92,6 +92,16 @@ final class VideoService: VideoServicing {
             "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
             forHTTPHeaderField: "User-Agent"
         )
+        let cookies = client.cookies
+        if !cookies.isEmpty {
+            request.setValue(cookies, forHTTPHeaderField: "Cookie")
+            request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+            request.setValue("https://www.youtube.com", forHTTPHeaderField: "X-Origin")
+            request.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
+            if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
+                request.setValue(authorization, forHTTPHeaderField: "Authorization")
+            }
+        }
         let body: [String: Any] = [
             "context": [
                 "client": [

@@ -391,7 +391,10 @@ final class PlayerStateManager {
             log.info("resolveAndPlay: native streaming \(streamURL.absoluteString, privacy: .public)")
         } else {
             log.error("resolveAndPlay: native streaming unavailable for \(video.id, privacy: .public)")
-            loadState = .failed("No playable native stream is available for this video.")
+            let hasLogin = !(CookieStore.shared.loadHeader() ?? "").isEmpty
+            loadState = .failed(hasLogin
+                ? "YouTube did not provide a native stream for this session. Please refresh your login and try again."
+                : "YouTube requires verification for this video. Sign in from Library, then try again in the native player.")
             stopProgressObservation()
             return
         }
@@ -476,6 +479,17 @@ final class PlayerStateManager {
     /// player.js scrape — that's our second tier. Returns nil only when all four tiers fail.
     private func resolveStreamingURL(videoID: String, quality: VideoQuality) async -> URL? {
         let service = VideoService()
+
+        // Fast native path. Android currently exposes a muxed H.264/AAC MP4 (itag 18) for many
+        // videos that iOS/TV clients gate behind PoToken or sign-in. Logged-in FreeTube cookies
+        // are attached by VideoService when available.
+        if let androidURL = try? await service.fetchAndroidProgressiveURL(
+            id: videoID,
+            maxHeight: quality.heightCap ?? .max
+        ) {
+            return androidURL
+        }
+
         if let info = try? await service.fetchInfo(id: videoID) {
             if let hls = info.streamingURL { return hls }
             logFormats(videoID: videoID, source: "IOS", formats: info.formats)
@@ -489,16 +503,6 @@ final class PlayerStateManager {
             if let progressive = Self.pickProgressiveURL(from: info.formats, maxHeight: quality.heightCap ?? .max) {
                 return progressive
             }
-        }
-
-        // Android's InnerTube client often returns itag 18 (muxed H.264 + AAC MP4) even when
-        // iOS/TV clients demand sign-in or a PoToken. This is still native playback: the raw
-        // request only obtains the CDN URL, then AVPlayer handles the media directly.
-        if let androidURL = try? await service.fetchAndroidProgressiveURL(
-            id: videoID,
-            maxHeight: quality.heightCap ?? .max
-        ) {
-            return androidURL
         }
 
         // Final native tier: YouTubeKit fetches the active player.js and decodes
