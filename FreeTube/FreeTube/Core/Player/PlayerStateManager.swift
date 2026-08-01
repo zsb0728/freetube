@@ -490,6 +490,20 @@ final class PlayerStateManager {
                 return progressive
             }
         }
+
+        // Final native tier: YouTubeKit fetches the active player.js and decodes
+        // signatureCipher/n into direct URLs entirely in Swift. The download fallback already
+        // uses this response, but playback previously skipped it and jumped straight to an error.
+        // Prefer a muxed MP4 so AVPlayer can play it without Python, ffmpeg, or a web view.
+        if let result = try? await service.fetchInfoWithFormats(id: videoID) {
+            logFormats(videoID: videoID, source: "PLAYER_JS", formats: result.formats)
+            if let progressive = Self.pickProgressiveURL(
+                from: result.formats,
+                maxHeight: quality.heightCap ?? .max
+            ) {
+                return progressive
+            }
+        }
         return nil
     }
 
