@@ -141,16 +141,41 @@ private struct YouTubeWatchFallback: UIViewRepresentable {
         view.isOpaque = false
         view.backgroundColor = .black
         view.scrollView.backgroundColor = .black
-        load(videoID: videoID, in: view)
+        prepareAndLoad(videoID: videoID, in: view, coordinator: context.coordinator)
         return view
     }
 
     func updateUIView(_ view: WKWebView, context: Context) {
         guard context.coordinator.loadedVideoID != videoID else { return }
-        load(videoID: videoID, in: view)
+        prepareAndLoad(videoID: videoID, in: view, coordinator: context.coordinator)
     }
 
-    private func load(videoID: String, in view: WKWebView) {
+    private func prepareAndLoad(videoID: String, in view: WKWebView, coordinator: Coordinator) {
+        // Mark before any asynchronous cookie work. SwiftUI may call updateUIView repeatedly while
+        // the first navigation is pending; without this guard each pass reloads the full YouTube
+        // page and creates a new media element/WebContent workload.
+        coordinator.loadedVideoID = videoID
+
+        let cookies = Self.cookiesFromStoredHeader()
+        guard !cookies.isEmpty else {
+            Self.loadWatchPage(videoID: videoID, in: view)
+            return
+        }
+
+        let group = DispatchGroup()
+        for cookie in cookies {
+            group.enter()
+            view.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) {
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            guard coordinator.loadedVideoID == videoID else { return }
+            Self.loadWatchPage(videoID: videoID, in: view)
+        }
+    }
+
+    private static func loadWatchPage(videoID: String, in view: WKWebView) {
         guard var components = URLComponents(string: "https://m.youtube.com/watch") else { return }
         components.queryItems = [
             URLQueryItem(name: "v", value: videoID),
@@ -160,14 +185,28 @@ private struct YouTubeWatchFallback: UIViewRepresentable {
         view.load(URLRequest(url: url))
     }
 
+    /// Converts the Keychain-only Cookie header into in-memory WebKit cookies. Values are never
+    /// logged or persisted elsewhere. YouTube-scoped auth cookies let restricted watch pages pass
+    /// the anonymous "confirm you're not a bot" interstitial when the user signed in in FreeTube.
+    private static func cookiesFromStoredHeader() -> [HTTPCookie] {
+        guard let header = CookieStore.shared.loadHeader(), !header.isEmpty else { return [] }
+        return header.split(separator: ";").compactMap { field in
+            let pair = field.trimmingCharacters(in: .whitespaces)
+            guard let separator = pair.firstIndex(of: "=") else { return nil }
+            let name = String(pair[..<separator])
+            let value = String(pair[pair.index(after: separator)...])
+            guard !name.isEmpty else { return nil }
+            return HTTPCookie(properties: [
+                .name: name,
+                .value: value,
+                .domain: ".youtube.com",
+                .path: "/",
+                .secure: "TRUE"
+            ])
+        }
+    }
+
     final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedVideoID: String?
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            loadedVideoID = URLComponents(
-                url: webView.url ?? URL(fileURLWithPath: "/"),
-                resolvingAgainstBaseURL: false
-            )?.queryItems?.first(where: { $0.name == "v" })?.value
-        }
     }
 }
