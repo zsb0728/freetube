@@ -18,7 +18,7 @@ struct FreeTubeApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            SideloadRootView()
                 .environment(appEnvironment.playerStateManager)
                 .modelContainer(PersistenceController.sharedContainer)
                 // Dark-only appearance app-wide. No user-facing toggle — the player chrome,
