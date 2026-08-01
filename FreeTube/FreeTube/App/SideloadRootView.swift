@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 /// Conservative sideload shell for iOS 27 compatibility.
 ///
@@ -100,24 +101,73 @@ private struct NativePlayerScreen: View {
                 .padding(.horizontal)
                 .padding(.vertical, 10)
 
-                PlayerSurface(player: player.player)
-                    .aspectRatio(16 / 9, contentMode: .fit)
-                    .background(Color.black)
-                    .overlay {
-                        DownloadProgressOverlay(state: player.loadState)
-                    }
-
-                Spacer()
-
-                if case .failed(let message) = player.loadState {
-                    Text(message)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .padding()
+                if case .failed = player.loadState,
+                   let videoID = player.currentVideo?.id {
+                    YouTubeWatchFallback(videoID: videoID)
+                        .ignoresSafeArea(edges: .bottom)
+                } else {
+                    PlayerSurface(player: player.player)
+                        .aspectRatio(16 / 9, contentMode: .fit)
+                        .background(Color.black)
+                        .overlay {
+                            DownloadProgressOverlay(state: player.loadState)
+                        }
+                    Spacer()
                 }
             }
         }
         .preferredColorScheme(.dark)
         .interactiveDismissDisabled()
+    }
+}
+
+
+@available(iOS 17.0, *)
+private struct YouTubeWatchFallback: UIViewRepresentable {
+    let videoID: String
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
+        configuration.websiteDataStore = .default()
+
+        let view = WKWebView(frame: .zero, configuration: configuration)
+        view.navigationDelegate = context.coordinator
+        view.allowsBackForwardNavigationGestures = false
+        view.scrollView.contentInsetAdjustmentBehavior = .never
+        view.isOpaque = false
+        view.backgroundColor = .black
+        view.scrollView.backgroundColor = .black
+        load(videoID: videoID, in: view)
+        return view
+    }
+
+    func updateUIView(_ view: WKWebView, context: Context) {
+        guard context.coordinator.loadedVideoID != videoID else { return }
+        load(videoID: videoID, in: view)
+    }
+
+    private func load(videoID: String, in view: WKWebView) {
+        guard var components = URLComponents(string: "https://m.youtube.com/watch") else { return }
+        components.queryItems = [
+            URLQueryItem(name: "v", value: videoID),
+            URLQueryItem(name: "app", value: "desktop")
+        ]
+        guard let url = components.url else { return }
+        view.load(URLRequest(url: url))
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var loadedVideoID: String?
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            loadedVideoID = URLComponents(
+                url: webView.url ?? URL(fileURLWithPath: "/"),
+                resolvingAgainstBaseURL: false
+            )?.queryItems?.first(where: { $0.name == "v" })?.value
+        }
     }
 }

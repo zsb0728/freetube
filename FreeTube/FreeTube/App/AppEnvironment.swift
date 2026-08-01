@@ -35,7 +35,7 @@ final class AppEnvironment {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(3))
                 self?.playerStateManager.load(Video(
-                    id: "dQw4w9WgXcQ",
+                    id: "angu54OTcsc",
                     title: "Diagnostic playback",
                     channelID: "",
                     channelName: "Diagnostic",
