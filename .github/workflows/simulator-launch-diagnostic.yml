@@ -63,8 +63,8 @@ jobs:
             > "$RUNNER_TEMP/launch.log" 2>&1 &
           LOG_PID=$!
 
-          xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE_ID" | tee "$RUNNER_TEMP/launch-result.txt"
-          sleep 12
+          xcrun simctl launch --terminate-running-process "$UDID" "$BUNDLE_ID" --diagnostic-autoplay | tee "$RUNNER_TEMP/launch-result.txt"
+          sleep 20
           xcrun simctl io "$UDID" screenshot "$RUNNER_TEMP/FreeTube-simulator.png" || true
           xcrun simctl spawn "$UDID" log show --last 2m --style compact \
             --predicate "process == 'FreeTube' OR eventMessage CONTAINS[c] '$BUNDLE_ID'" \
@@ -75,7 +75,17 @@ jobs:
           echo '--- Recent log ---'
           cat "$RUNNER_TEMP/log-show.txt" || true
 
-          if grep -Eiq 'crash|abort|fatal error|dyld.*error|termination reason|uncaught exception' "$RUNNER_TEMP/launch.log" "$RUNNER_TEMP/log-show.txt"; then
+          for dir in "$HOME/Library/Logs/DiagnosticReports" "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Library/Logs/CrashReporter"; do
+            if [[ -d "$dir" ]]; then
+              find "$dir" -type f \( -iname '*FreeTube*' -o -iname '*.ips' \) -mmin -10 -exec cp {} "$RUNNER_TEMP/" \; || true
+            fi
+          done
+
+          if ! xcrun simctl spawn "$UDID" launchctl procinfo "$(awk '{print $2}' "$RUNNER_TEMP/launch-result.txt")" >/dev/null 2>&1; then
+            echo 'FreeTube process exited during autoplay diagnostic' >&2
+            exit 1
+          fi
+          if grep -Eiq 'SIGSEGV|crash|abort|fatal error|dyld.*error|termination reason|uncaught exception' "$RUNNER_TEMP/launch.log" "$RUNNER_TEMP/log-show.txt"; then
             echo 'Detected launch failure' >&2
             exit 1
           fi
@@ -90,5 +100,7 @@ jobs:
             ${{ runner.temp }}/launch-result.txt
             ${{ runner.temp }}/log-show.txt
             ${{ runner.temp }}/FreeTube-simulator.png
+            ${{ runner.temp }}/*.ips
+            ${{ runner.temp }}/*.crash
           if-no-files-found: warn
           retention-days: 7

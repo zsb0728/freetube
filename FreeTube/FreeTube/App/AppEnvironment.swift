@@ -27,6 +27,29 @@ final class AppEnvironment {
         // rotating Swift cooperative-pool worker and can SIGSEGV during first-launch refresh.
         // Playback uses the native YouTubeKit/AVPlayer streaming path instead.
         // YtDlpUpdater.shared.refreshIfStale()
+
+        // Simulator-only diagnostic hook. Normal builds never contain this launch argument.
+        // It reproduces a real video tap after the SwiftUI scene has appeared so CI can capture
+        // crashes from popup presentation, native URL resolution, and AVPlayerItem creation.
+        if ProcessInfo.processInfo.arguments.contains("--diagnostic-autoplay") {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(3))
+                self?.playerStateManager.load(Video(
+                    id: "dQw4w9WgXcQ",
+                    title: "Diagnostic playback",
+                    channelID: "",
+                    channelName: "Diagnostic",
+                    channelThumbnailURL: nil,
+                    thumbnailURL: nil,
+                    duration: nil,
+                    viewCount: nil,
+                    publishedAt: nil,
+                    descriptionSnippet: nil,
+                    isLive: false,
+                    isShort: false
+                ))
+            }
+        }
         #if DEBUG
         runJavaScriptCoreSmokeTest()
         #endif
