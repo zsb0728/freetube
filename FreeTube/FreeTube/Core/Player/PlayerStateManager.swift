@@ -375,39 +375,25 @@ final class PlayerStateManager {
         // bar. Cancelled in `dismiss()` and replaced on each `load`.
         startProgressObservation(for: video.id)
 
-        // Three-tier playback resolution:
-        //   1. `ensureDownloaded` — yt-dlp into local file, then YouTubeKit progressive fallback
-        //      inside it. Returns a `file://` URL on success.
-        //   2. **HLS streaming** — last resort when every download path is blocked (PoT 403s,
-        //      cipher-decode broken, etc.). `AVPlayerItem(url:)` accepts an HLS master-playlist
-        //      URL identically to a file URL — AVFoundation handles segment fetching itself, so
-        //      we get playback without needing to predownload or decode signature ciphers. The
-        //      trade-off is no local file ⇒ the video isn't watchable offline, doesn't appear in
-        //      Downloads, and doesn't burn cache storage. But it plays.
+        // Sideload-stable playback path. Embedded CPython/YoutubeDL currently SIGSEGVs when
+        // initialized from Swift's cooperative pool, so never invoke it from a play tap.
+        // Reuse an existing local download when available; otherwise resolve a native HLS or
+        // progressive MP4 URL through YouTubeKit and hand it directly to AVPlayer.
         let playbackURL: URL
-        do {
-            loadState = .downloading(progress: 0, phase: nil)
-            // `.userInitiated` priority — the user just tapped Play and is actively waiting.
-            // If a long background queue (playlist Download All) is in flight, this jumps the
-            // line so playback starts as soon as the currently-running yt-dlp finishes, instead
-            // of after every queued download.
-            playbackURL = try await DownloadManager.shared.ensureDownloaded(
-                video: video,
-                quality: preferences.preferredQuality,
-                priority: .userInitiated
-            )
-            log.info("resolveAndPlay: local file \(playbackURL.path, privacy: .public)")
-        } catch {
-            log.error("resolveAndPlay: download path FAILED for \(video.id, privacy: .public): \(String(describing: error), privacy: .public) — trying remote stream")
-            if let streamURL = await resolveStreamingURL(videoID: video.id, quality: preferences.preferredQuality) {
-                log.info("resolveAndPlay: streaming \(streamURL.absoluteString, privacy: .public)")
-                playbackURL = streamURL
-            } else {
-                log.error("resolveAndPlay: streaming fallback also unavailable for \(video.id, privacy: .public)")
-                loadState = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
-                stopProgressObservation()
-                return
-            }
+        if let local = DownloadManager.shared.localFile(for: video.id) {
+            playbackURL = local
+            log.info("resolveAndPlay: cache hit \(local.path, privacy: .public)")
+        } else if let streamURL = await resolveStreamingURL(
+            videoID: video.id,
+            quality: preferences.preferredQuality
+        ) {
+            playbackURL = streamURL
+            log.info("resolveAndPlay: native streaming \(streamURL.absoluteString, privacy: .public)")
+        } else {
+            log.error("resolveAndPlay: native streaming unavailable for \(video.id, privacy: .public)")
+            loadState = .failed("No playable native stream is available for this video.")
+            stopProgressObservation()
+            return
         }
         let item = AVPlayerItem(url: playbackURL)
         loadItem(item)
@@ -455,7 +441,13 @@ final class PlayerStateManager {
     /// **User-gated** by `UserPreferences.prefetchNextInQueue`. Off → no background download
     /// is started; Next-tap will then fall into the standard `ensureDownloaded` path with
     /// `.userInitiated` priority (still works, just no head-start).
+    /// Disabled in the sideload-stable build because prefetch enters the same embedded-Python
+    /// path that can SIGSEGV. Playback resolves native HLS/progressive URLs on demand.
     private func prefetchNextUpcoming() {
+        log.debug("prefetch: disabled in sideload-stable build")
+    }
+
+    private func disabledPythonPrefetchNextUpcoming() {
         guard preferences.prefetchNextInQueue else {
             log.debug("prefetch: disabled in settings, skipping")
             return

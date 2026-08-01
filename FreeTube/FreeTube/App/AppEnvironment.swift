@@ -23,7 +23,10 @@ final class AppEnvironment {
         // background. Doesn't interfere with the next playback attempt — the download is
         // detached and the cached copy stays usable until the new one fully lands. See
         // `YtDlpUpdater` for the longer rationale.
-        YtDlpUpdater.shared.refreshIfStale()
+        // Disabled for sideload builds: YoutubeDL-iOS initializes embedded CPython on a
+        // rotating Swift cooperative-pool worker and can SIGSEGV during first-launch refresh.
+        // Playback uses the native YouTubeKit/AVPlayer streaming path instead.
+        // YtDlpUpdater.shared.refreshIfStale()
         #if DEBUG
         runJavaScriptCoreSmokeTest()
         #endif
