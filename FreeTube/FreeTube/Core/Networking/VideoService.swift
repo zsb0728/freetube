@@ -32,6 +32,8 @@ protocol VideoServicing: Sendable {
     /// as `fetchInfo`, but the returned per-format URLs aren't PoT-protected. Used by the resolver
     /// as a fallback when the iOS client gives us only PoT-locked adaptive streams.
     func fetchInfoViaTVHTML5(id: String) async throws -> VideoInfo
+    /// Raw Android InnerTube fallback. Returns a direct muxed MP4 URL without Python or WebKit.
+    func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL
 }
 
 /// Wraps `VideoInfosResponse`, `VideoInfosWithDownloadFormatsResponse`, `MoreVideoInfosResponse`.
@@ -78,6 +80,66 @@ final class VideoService: VideoServicing {
             log.error("fetchInfo[TVHTML5] FAILED id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
             throw YouTubeServiceError.network(error)
         }
+    }
+
+    func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL {
+        log.info("fetchAndroidProgressiveURL start id=\(id, privacy: .public)")
+        let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(
+            "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
+            forHTTPHeaderField: "User-Agent"
+        )
+        let body: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "ANDROID",
+                    "clientVersion": "21.26.364",
+                    "androidSdkVersion": 30,
+                    "userAgent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
+                    "osName": "Android",
+                    "osVersion": "11"
+                ]
+            ],
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        if let playability = json["playabilityStatus"] as? [String: Any],
+           let status = playability["status"] as? String,
+           status != "OK" {
+            log.notice("Android client playability=\(status, privacy: .public)")
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        guard let streaming = json["streamingData"] as? [String: Any],
+              let rawFormats = streaming["formats"] as? [[String: Any]] else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        let candidates: [(url: URL, height: Int)] = rawFormats.compactMap { format in
+            guard let mime = format["mimeType"] as? String,
+                  mime.lowercased().contains("video/mp4"),
+                  mime.lowercased().contains("mp4a"),
+                  let urlString = format["url"] as? String,
+                  let url = URL(string: urlString) else { return nil }
+            let height = format["height"] as? Int ?? 0
+            guard height <= maxHeight || maxHeight <= 0 else { return nil }
+            return (url, height)
+        }
+        guard let best = candidates.max(by: { $0.height < $1.height }) else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        log.info("Android client selected muxed MP4 height=\(best.height, privacy: .public)")
+        return best.url
     }
 
     func fetchInfoWithFormats(id: String) async throws -> VideoInfoWithFormats {

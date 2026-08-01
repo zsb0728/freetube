@@ -491,6 +491,16 @@ final class PlayerStateManager {
             }
         }
 
+        // Android's InnerTube client often returns itag 18 (muxed H.264 + AAC MP4) even when
+        // iOS/TV clients demand sign-in or a PoToken. This is still native playback: the raw
+        // request only obtains the CDN URL, then AVPlayer handles the media directly.
+        if let androidURL = try? await service.fetchAndroidProgressiveURL(
+            id: videoID,
+            maxHeight: quality.heightCap ?? .max
+        ) {
+            return androidURL
+        }
+
         // Final native tier: YouTubeKit fetches the active player.js and decodes
         // signatureCipher/n into direct URLs entirely in Swift. The download fallback already
         // uses this response, but playback previously skipped it and jumped straight to an error.
