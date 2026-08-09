@@ -15,6 +15,16 @@ final class AppEnvironment {
         // entry timestamp is set to "1 minute ago" so it also grabs the pre-init logs
         // from app startup.
         _ = LogFileWriter.shared
+        // One-time migration: older builds defaulted every install to 360p. Merely changing the
+        // @AppStorage default does not affect an existing UserDefaults value, so upgrade that old
+        // untouched default to 1080p once. Users who choose another quality afterwards keep it.
+        let defaults = UserDefaults.standard
+        if !defaults.bool(forKey: "didMigrateDefaultQualityTo1080p") {
+            if defaults.string(forKey: "preferredQuality") == VideoQuality.p360.rawValue {
+                defaults.set(VideoQuality.p1080.rawValue, forKey: "preferredQuality")
+            }
+            defaults.set(true, forKey: "didMigrateDefaultQualityTo1080p")
+        }
         AudioSessionConfigurator.configure()
         RemoteCommandCenter.wire(to: playerStateManager)
         BackgroundDownloadCoordinator.shared.registerBackgroundTasks()

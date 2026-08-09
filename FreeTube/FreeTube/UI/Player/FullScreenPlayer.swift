@@ -45,6 +45,11 @@ struct FullScreenPlayer: View {
     /// presentation. We capture the whole `Video` (not just the id) so the sheet can show its
     /// title at the top of the picker.
     @State private var addToPlaylistVideo: Video?
+    /// Custom transport chrome is hidden during playback. A tap on the video reveals it and a
+    /// short inactivity timer hides it again, matching native player behavior without permanently
+    /// covering the picture.
+    @State private var showsOverlayControls = false
+    @State private var controlsHideTask: Task<Void, Never>?
 
     /// Hashable wrapper so `.navigationDestination(for:)` can match the channel id and push
     /// `ChannelScreen` onto `channelPath`.
@@ -76,16 +81,22 @@ struct FullScreenPlayer: View {
                 // item).
                 ZStack {
                     Color.black
-                    PlayerSurface(player: player.player)
+                    PlayerSurface(player: player.player, showsControls: false)
                     DownloadProgressOverlay(state: player.loadState)
-                    VStack {
-                        Spacer()
-                        transportRow
-                            .padding(.vertical, 8)
-                            .padding(.horizontal, 6)
-                            .background(.ultraThinMaterial, in: Capsule())
-                            .padding(.horizontal, 12)
-                            .padding(.bottom, 8)
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { revealOverlayControls() }
+                    if showsOverlayControls {
+                        VStack {
+                            Spacer()
+                            transportRow
+                                .padding(.vertical, 8)
+                                .padding(.horizontal, 6)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 8)
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
                     }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.width * 9 / 16)
@@ -512,6 +523,21 @@ struct FullScreenPlayer: View {
     }
 
     // MARK: - Transport
+
+    private func revealOverlayControls() {
+        controlsHideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.18)) {
+            showsOverlayControls.toggle()
+        }
+        guard showsOverlayControls else { return }
+        controlsHideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showsOverlayControls = false
+            }
+        }
+    }
 
     @ViewBuilder
     private var transportRow: some View {
