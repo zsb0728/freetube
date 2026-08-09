@@ -36,6 +36,9 @@ final class PlayerStateManager {
     private(set) var isPlaying: Bool = false
     private(set) var elapsed: TimeInterval = 0
     private(set) var duration: TimeInterval = 0
+    /// Human-readable source/quality shown by the full player. This reports the actual selected
+    /// native path, not merely the user's preferred ceiling.
+    private(set) var playbackQualityLabel: String = "Resolving…"
     var miniPlayerVisible: Bool = false
     var fullScreenPresented: Bool = false
 
@@ -181,6 +184,7 @@ final class PlayerStateManager {
             player.removeAllItems()
         }
         currentVideo = video
+        playbackQualityLabel = "Resolving…"
         // Keep the queue coherent. Fresh taps from search/home append the video; subsequent calls
         // from `playNext()` / `playPrevious()` find it already there and just update `currentIndex`.
         queue.setCurrent(video)
@@ -241,6 +245,22 @@ final class PlayerStateManager {
             )
         }
     }
+
+    func selectQuality(_ quality: VideoQuality) {
+        preferences.preferredQuality = quality
+        guard let video = currentVideo else { return }
+        let resumeTime = elapsed
+        load(video, autoplay: true, skipRecommendations: true)
+        if resumeTime > 1 {
+            Task { @MainActor [weak self] in
+                // Give the replacement AVPlayerItem time to install before restoring position.
+                try? await Task.sleep(for: .seconds(1))
+                self?.seek(to: resumeTime)
+            }
+        }
+    }
+
+    var preferredQuality: VideoQuality { preferences.preferredQuality }
 
     func play() {
         log.info("play()")
@@ -484,6 +504,7 @@ final class PlayerStateManager {
         // can return a master HLS manifest containing HD variants; AVPlayer automatically adapts
         // between them and honors the user's preferred peak resolution.
         if let hls = try? await service.fetchAuthenticatedSafariHLSURL(id: videoID) {
+            playbackQualityLabel = "Adaptive HD · HLS"
             return hls
         }
 
@@ -494,6 +515,7 @@ final class PlayerStateManager {
             id: videoID,
             maxHeight: quality.heightCap ?? .max
         ) {
+            playbackQualityLabel = "360p · MP4 fallback"
             return androidURL
         }
 

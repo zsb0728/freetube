@@ -597,6 +597,26 @@ struct FullScreenPlayer: View {
                     }
                 }
                 Button {
+                    shareFileURL = watchURL(video)
+                } label: {
+                    Label("Share…", systemImage: "square.and.arrow.up")
+                }
+                Menu {
+                    ForEach([VideoQuality.auto, .p1080, .p720, .p360], id: \.rawValue) { quality in
+                        Button {
+                            player.selectQuality(quality)
+                        } label: {
+                            if player.preferredQuality == quality {
+                                Label(quality.rawValue.capitalized, systemImage: "checkmark")
+                            } else {
+                                Text(quality.rawValue.capitalized)
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Quality · \(player.playbackQualityLabel)", systemImage: "gearshape")
+                }
+                Button {
                     if let url = watchURL(video) {
                         UIPasteboard.general.string = url.absoluteString
                     }
@@ -720,7 +740,7 @@ struct FullScreenPlayer: View {
                 panel = (panel == .queue) ? .comments : .queue
             }
         } label: {
-            Image(systemName: "list.bullet")
+            Image(systemName: panel == .queue ? "text.bubble" : "list.bullet")
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Color.primary)
                 .frame(width: 44, height: 28)
@@ -731,6 +751,7 @@ struct FullScreenPlayer: View {
                 }
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(panel == .queue ? "Show comments" : "Show up next queue")
     }
 
     // MARK: - Queue controls (shuffle + repeat)
