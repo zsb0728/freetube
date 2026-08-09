@@ -34,6 +34,8 @@ protocol VideoServicing: Sendable {
     func fetchInfoViaTVHTML5(id: String) async throws -> VideoInfo
     /// Raw Android InnerTube fallback. Returns a direct muxed MP4 URL without Python or WebKit.
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL
+    /// Authenticated Web-Safari HLS. AVPlayer can adapt this manifest up to HD/1080p.
+    func fetchAuthenticatedSafariHLSURL(id: String) async throws -> URL
 }
 
 /// Wraps `VideoInfosResponse`, `VideoInfosWithDownloadFormatsResponse`, `MoreVideoInfosResponse`.
@@ -82,6 +84,50 @@ final class VideoService: VideoServicing {
             log.error("fetchInfo[TVHTML5] FAILED id=\(id, privacy: .public): \(String(describing: error), privacy: .public)")
             throw YouTubeServiceError.network(error)
         }
+    }
+
+    func fetchAuthenticatedSafariHLSURL(id: String) async throws -> URL {
+        let cookies = client.cookies
+        guard !cookies.isEmpty else { throw YouTubeServiceError.notAuthenticated }
+        let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
+        let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)"
+        let body: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "WEB",
+                    "clientVersion": "2.20260708.00.00",
+                    "userAgent": safariUA,
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ],
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(safariUA, forHTTPHeaderField: "User-Agent")
+        request.setValue(cookies, forHTTPHeaderField: "Cookie")
+        request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://www.youtube.com", forHTTPHeaderField: "X-Origin")
+        request.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
+        if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
+            request.setValue(authorization, forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let streaming = json["streamingData"] as? [String: Any],
+              let hlsString = streaming["hlsManifestUrl"] as? String,
+              let url = URL(string: hlsString) else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        log.info("Authenticated Web-Safari returned native HLS")
+        return url
     }
 
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL {

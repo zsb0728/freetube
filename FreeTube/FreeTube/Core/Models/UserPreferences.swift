@@ -4,10 +4,10 @@ import SwiftUI
 /// Lightweight user preferences stored in `UserDefaults` via `@AppStorage`. Use this for primitive flags only;
 /// anything queryable belongs in SwiftData.
 struct UserPreferences {
-    /// Default to 360p on a fresh install — it's the only YouTube format that ships as a single
-    /// combined progressive mp4 (itag 18), so downloads complete fast and skip the Swift-side
-    /// ffmpeg mux step. Users can bump it higher in Settings.
-    @AppStorage("preferredQuality") var preferredQualityRaw: String = VideoQuality.p360.rawValue
+    /// Native playback targets 1080p by default. YouTube may still return a lower fallback when
+    /// the session lacks an HD HLS/DASH URL, but we no longer voluntarily cap fresh installs at
+    /// itag 18's 360p.
+    @AppStorage("preferredQuality") var preferredQualityRaw: String = VideoQuality.p1080.rawValue
     @AppStorage("alwaysDownloadBeforePlayback") var alwaysDownloadBeforePlayback: Bool = false
     /// When `true`, downloads (and playback-time fetches, since those use the same path) are
     /// allowed to run over cellular. Default is `true` — permissive — so a fresh install

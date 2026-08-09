@@ -480,6 +480,13 @@ final class PlayerStateManager {
     private func resolveStreamingURL(videoID: String, quality: VideoQuality) async -> URL? {
         let service = VideoService()
 
+        // Best-quality native path for signed-in/trusted sessions. YouTube's Web-Safari client
+        // can return a master HLS manifest containing HD variants; AVPlayer automatically adapts
+        // between them and honors the user's preferred peak resolution.
+        if let hls = try? await service.fetchAuthenticatedSafariHLSURL(id: videoID) {
+            return hls
+        }
+
         // Fast native path. Android currently exposes a muxed H.264/AAC MP4 (itag 18) for many
         // videos that iOS/TV clients gate behind PoToken or sign-in. Logged-in FreeTube cookies
         // are attached by VideoService when available.
