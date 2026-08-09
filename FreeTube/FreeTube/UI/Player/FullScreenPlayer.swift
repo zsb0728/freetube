@@ -81,23 +81,8 @@ struct FullScreenPlayer: View {
                 // item).
                 ZStack {
                     Color.black
-                    PlayerSurface(player: player.player, showsControls: false)
+                    PlayerSurface(player: player.player, showsControls: true)
                     DownloadProgressOverlay(state: player.loadState)
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .onTapGesture { revealOverlayControls() }
-                    if showsOverlayControls {
-                        VStack {
-                            Spacer()
-                            transportRow
-                                .padding(.vertical, 8)
-                                .padding(.horizontal, 6)
-                                .background(.ultraThinMaterial, in: Capsule())
-                                .padding(.horizontal, 12)
-                                .padding(.bottom, 8)
-                        }
-                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                    }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.width * 9 / 16)
             // Pull-down-to-dismiss starting from the video surface.
