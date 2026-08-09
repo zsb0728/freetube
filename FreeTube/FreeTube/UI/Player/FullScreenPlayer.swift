@@ -78,6 +78,15 @@ struct FullScreenPlayer: View {
                     Color.black
                     PlayerSurface(player: player.player)
                     DownloadProgressOverlay(state: player.loadState)
+                    VStack {
+                        Spacer()
+                        transportRow
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 6)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 8)
+                    }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.width * 9 / 16)
             // Pull-down-to-dismiss starting from the video surface.
@@ -101,9 +110,6 @@ struct FullScreenPlayer: View {
                         }
                     }
             )
-
-            transportRow
-                .padding(.vertical, 10)
 
             Divider()
 

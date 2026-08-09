@@ -2,6 +2,12 @@ import Foundation
 import OSLog
 import YouTubeKit
 
+struct NativeAdaptiveStreams: Sendable {
+    let videoURL: URL
+    let audioURL: URL
+    let height: Int
+}
+
 struct VideoInfo: Sendable {
     let video: Video
     let descriptionText: String?
@@ -34,6 +40,8 @@ protocol VideoServicing: Sendable {
     func fetchInfoViaTVHTML5(id: String) async throws -> VideoInfo
     /// Raw Android InnerTube fallback. Returns a direct muxed MP4 URL without Python or WebKit.
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL
+    /// Legacy Android exposes direct DASH video+audio URLs suitable for AVMutableComposition.
+    func fetchLegacyAndroidAdaptiveStreams(id: String, maxHeight: Int) async throws -> NativeAdaptiveStreams
     /// Authenticated Web-Safari HLS. AVPlayer can adapt this manifest up to HD/1080p.
     func fetchAuthenticatedSafariHLSURL(id: String) async throws -> URL
 }
@@ -128,6 +136,65 @@ final class VideoService: VideoServicing {
         }
         log.info("Authenticated Web-Safari returned native HLS")
         return url
+    }
+
+    func fetchLegacyAndroidAdaptiveStreams(id: String, maxHeight: Int) async throws -> NativeAdaptiveStreams {
+        // Android 20.26.01 predates the server-ABR-only response rollout and still returns
+        // direct DASH URLs for H.264 video plus AAC audio. They are played in-process through
+        // AVMutableComposition, not downloaded, muxed, or handed to a browser.
+        let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
+        let userAgent = "com.google.android.youtube/20.26.01 (Linux; U; Android 11) gzip"
+        let body: [String: Any] = [
+            "context": ["client": [
+                "clientName": "ANDROID",
+                "clientVersion": "20.26.01",
+                "androidSdkVersion": 30,
+                "userAgent": userAgent,
+                "osName": "Android",
+                "osVersion": "11"
+            ]],
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let streaming = json["streamingData"] as? [String: Any],
+              let formats = streaming["adaptiveFormats"] as? [[String: Any]] else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+
+        func directURL(_ format: [String: Any]) -> URL? {
+            guard let value = format["url"] as? String else { return nil }
+            return URL(string: value)
+        }
+        let videoCandidates: [(url: URL, height: Int)] = formats.compactMap { format in
+            guard let mime = format["mimeType"] as? String,
+                  mime.lowercased().contains("video/mp4"),
+                  let height = format["height"] as? Int,
+                  height <= maxHeight,
+                  let url = directURL(format) else { return nil }
+            return (url, height)
+        }
+        let audioCandidates: [(url: URL, bitrate: Int)] = formats.compactMap { format in
+            guard let mime = format["mimeType"] as? String,
+                  mime.lowercased().contains("audio/mp4"),
+                  let url = directURL(format) else { return nil }
+            return (url, format["bitrate"] as? Int ?? 0)
+        }
+        guard let video = videoCandidates.max(by: { $0.height < $1.height }),
+              let audio = audioCandidates.max(by: { $0.bitrate < $1.bitrate }) else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        log.info("Legacy Android selected native adaptive MP4 height=\(video.height, privacy: .public)")
+        return NativeAdaptiveStreams(videoURL: video.url, audioURL: audio.url, height: video.height)
     }
 
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL {

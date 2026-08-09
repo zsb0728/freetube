@@ -399,15 +399,23 @@ final class PlayerStateManager {
         // initialized from Swift's cooperative pool, so never invoke it from a play tap.
         // Reuse an existing local download when available; otherwise resolve a native HLS or
         // progressive MP4 URL through YouTubeKit and hand it directly to AVPlayer.
-        let playbackURL: URL
+        let item: AVPlayerItem
         if let local = DownloadManager.shared.localFile(for: video.id) {
-            playbackURL = local
+            item = AVPlayerItem(url: local)
+            playbackQualityLabel = "本地文件"
             log.info("resolveAndPlay: cache hit \(local.path, privacy: .public)")
+        } else if let adaptive = try? await VideoService().fetchLegacyAndroidAdaptiveStreams(
+            id: video.id,
+            maxHeight: preferences.preferredQuality.heightCap ?? 1080
+        ), let composedItem = try? await makeAdaptiveItem(adaptive) {
+            item = composedItem
+            playbackQualityLabel = "\(adaptive.height)p · 原生自适应"
+            log.info("resolveAndPlay: legacy Android adaptive \(adaptive.height, privacy: .public)p")
         } else if let streamURL = await resolveStreamingURL(
             videoID: video.id,
             quality: preferences.preferredQuality
         ) {
-            playbackURL = streamURL
+            item = AVPlayerItem(url: streamURL)
             log.info("resolveAndPlay: native streaming \(streamURL.absoluteString, privacy: .public)")
         } else {
             log.error("resolveAndPlay: native streaming unavailable for \(video.id, privacy: .public)")
@@ -418,7 +426,6 @@ final class PlayerStateManager {
             stopProgressObservation()
             return
         }
-        let item = AVPlayerItem(url: playbackURL)
         loadItem(item)
         loadState = .readyToPlay
         updateNowPlaying()
@@ -454,6 +461,41 @@ final class PlayerStateManager {
         } else {
             prefetchNextUpcoming()
         }
+    }
+
+    /// Combines remote DASH H.264 and AAC tracks in AVFoundation. Both assets stay remote and
+    /// AVPlayer performs range requests/buffering; no Python, ffmpeg, browser, or temporary file
+    /// is involved. This enables the direct 720p/1080p URLs returned by legacy Android clients.
+    private func makeAdaptiveItem(_ streams: NativeAdaptiveStreams) async throws -> AVPlayerItem {
+        let videoAsset = AVURLAsset(url: streams.videoURL)
+        let audioAsset = AVURLAsset(url: streams.audioURL)
+        async let videoTracks = videoAsset.loadTracks(withMediaType: .video)
+        async let audioTracks = audioAsset.loadTracks(withMediaType: .audio)
+        async let videoDuration = videoAsset.load(.duration)
+        async let audioDuration = audioAsset.load(.duration)
+        guard let sourceVideo = try await videoTracks.first,
+              let sourceAudio = try await audioTracks.first else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        let duration = min(try await videoDuration, try await audioDuration)
+        guard duration.isNumeric && duration > .zero else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        let composition = AVMutableComposition()
+        guard let videoTrack = composition.addMutableTrack(
+            withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ), let audioTrack = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            throw YouTubeServiceError.streamExtractionFailed
+        }
+        let range = CMTimeRange(start: .zero, duration: duration)
+        try videoTrack.insertTimeRange(range, of: sourceVideo, at: .zero)
+        try audioTrack.insertTimeRange(range, of: sourceAudio, at: .zero)
+        videoTrack.preferredTransform = sourceVideo.preferredTransform
+        return AVPlayerItem(asset: composition)
     }
 
     /// Fires `DownloadManager.ensureDownloaded` for just the next queued video, in the background.
