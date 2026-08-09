@@ -97,8 +97,7 @@ struct FullScreenPlayer: View {
                             && abs(value.translation.width) < value.translation.height
                         let fastFlick = value.predictedEndTranslation.height > 180
                         if mostlyDown || fastFlick {
-                            @Bindable var p = player
-                            p.fullScreenPresented = false
+                            player.dismiss()
                         }
                     }
             )
@@ -218,8 +217,7 @@ struct FullScreenPlayer: View {
 
         if #available(iOS 26.0, *) {
             Button {
-                @Bindable var p = player
-                p.fullScreenPresented = false
+                player.dismiss()
             } label: {
                 label
             }
@@ -229,8 +227,7 @@ struct FullScreenPlayer: View {
             .accessibilityLabel("Close full screen player")
         } else {
             Button {
-                @Bindable var p = player
-                p.fullScreenPresented = false
+                player.dismiss()
             } label: {
                 label
                     .background(.regularMaterial, in: Capsule())

@@ -41,7 +41,7 @@ struct SideloadRootView: View {
             await SessionManager.shared.bootstrap()
         }
         .fullScreenCover(isPresented: playerPresentation) {
-            NativePlayerScreen()
+            FullScreenPlayer()
                 .environment(player)
         }
         .onReceive(NotificationCenter.default.publisher(for: .freetubeSelectTab)) { note in
@@ -64,52 +64,5 @@ struct SideloadRootView: View {
                 if !presented { player.dismiss() }
             }
         )
-    }
-}
-
-@available(iOS 17.0, *)
-private struct NativePlayerScreen: View {
-    @Environment(PlayerStateManager.self) private var player
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                HStack {
-                    Button {
-                        player.dismiss()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 30))
-                            .symbolRenderingMode(.hierarchical)
-                    }
-                    .accessibilityLabel("Close")
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(player.currentVideo?.title ?? "FreeTube")
-                            .font(.headline)
-                            .lineLimit(1)
-                        Text(player.currentVideo?.channelName ?? "")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 10)
-
-                PlayerSurface(player: player.player)
-                    .aspectRatio(16 / 9, contentMode: .fit)
-                    .background(Color.black)
-                    .overlay {
-                        DownloadProgressOverlay(state: player.loadState)
-                    }
-                Spacer()
-            }
-        }
-        .preferredColorScheme(.dark)
-        .interactiveDismissDisabled()
     }
 }
