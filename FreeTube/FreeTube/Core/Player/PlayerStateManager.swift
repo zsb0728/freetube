@@ -492,22 +492,32 @@ final class PlayerStateManager {
         if let oldOutput = hdVideoOutput, let oldItem = player.currentItem {
             oldItem.remove(oldOutput)
         }
-        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ])
         item.add(output)
         hdVideoOutput = output
 
-        hdVideoOutputWatchTask = Task { @MainActor [weak self, weak item, weak output] in
-            guard let self, let item, let output else { return }
-            // Remote DASH often needs several seconds before the first decoded frame. Require an
-            // actual pixel buffer — status/size alone can both look healthy while the surface is
-            // black because CDN authorization or decoding failed after metadata loaded.
+        hdVideoOutputWatchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Keep the output strongly retained while polling. `readyToPlay` and
+            // `presentationSize` can both be nonzero before a CDN segment has decoded, so require
+            // an actual pixel buffer from the output pipeline.
             for _ in 0..<24 {
-                try? await Task.sleep(for: .milliseconds(500))
+                do {
+                    try await Task.sleep(for: .milliseconds(500))
+                } catch {
+                    return
+                }
                 guard !Task.isCancelled,
                       self.currentVideo?.id == videoID,
-                      self.player.currentItem === item else { return }
+                      let currentItem = self.player.currentItem,
+                      currentItem === item,
+                      let output = self.hdVideoOutput else { return }
                 let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
-                if output.hasNewPixelBuffer(forItemTime: itemTime) {
+                var displayTime = CMTime.invalid
+                if output.hasNewPixelBuffer(forItemTime: itemTime),
+                   output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil {
                     let size = item.presentationSize
                     self.hdDiagnosticMessage = "1080p H.264 已输出真实画面（\(Int(size.width))×\(Int(size.height))），音画同步中"
                     self.log.info("HD video produced decoded pixels size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
