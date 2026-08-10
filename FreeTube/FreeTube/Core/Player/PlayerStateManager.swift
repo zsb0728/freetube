@@ -576,9 +576,10 @@ final class PlayerStateManager {
         } else {
             log.error("resolveAndPlay: native streaming unavailable for \(video.id, privacy: .public)")
             let hasLogin = !(CookieStore.shared.loadHeader() ?? "").isEmpty
+            let diagnostic = hdDiagnosticMessage
             loadState = .failed(hasLogin
-                ? "YouTube did not provide a native stream for this session. Please refresh your login and try again."
-                : "YouTube requires verification for this video. Sign in from Library, then try again in the native player.")
+                ? "高清与兼容播放均失败：\(diagnostic)\n\n这不一定表示登录已过期，请打开右上角菜单复制高清诊断。"
+                : "YouTube 要求验证此视频。请先在资料库登录，然后重新播放。\n\n高清诊断：\(diagnostic)")
             stopProgressObservation()
             return
         }

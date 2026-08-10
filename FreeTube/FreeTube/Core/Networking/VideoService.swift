@@ -143,17 +143,20 @@ final class VideoService: VideoServicing {
     }
 
     func fetchLegacyAndroidAdaptiveStreams(id: String, maxHeight: Int) async throws -> NativeAdaptiveStreams {
+        // WEB-auth requests need the same visitor token as the signed-in YouTubeKit session.
+        await client.ensureVisitorData()
         // Android 20.26.01 predates the server-ABR-only response rollout and still returns
         // direct DASH URLs for H.264 video plus AAC audio. They are streamed by two synchronized
         // native AVPlayers; remote fragmented MP4 cannot be inserted into AVMutableComposition.
         let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
-        let userAgent = "com.google.android.youtube/20.26.01 (Linux; U; Android 11) gzip"
-        let body: [String: Any] = [
+        let androidUserAgent = "com.google.android.youtube/20.26.01 (Linux; U; Android 11) gzip"
+        let safariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+        let androidBody: [String: Any] = [
             "context": ["client": [
                 "clientName": "ANDROID",
                 "clientVersion": "20.26.01",
                 "androidSdkVersion": 30,
-                "userAgent": userAgent,
+                "userAgent": androidUserAgent,
                 "osName": "Android",
                 "osVersion": "11"
             ]],
@@ -161,19 +164,50 @@ final class VideoService: VideoServicing {
             "contentCheckOk": true,
             "racyCheckOk": true
         ]
+        let webBody: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "WEB",
+                    "clientVersion": "2.20260810.01.00",
+                    "userAgent": safariUserAgent,
+                    "platform": "DESKTOP",
+                    "hl": "zh-CN",
+                    "gl": "CN"
+                ],
+                "request": ["useSsl": true]
+            ],
+            "playbackContext": [
+                "contentPlaybackContext": ["html5Preference": "HTML5_PREF_WANTS"]
+            ],
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
         func playerJSON(useAuthentication: Bool) async throws -> [String: Any] {
+            // A Web login session must be presented as the WEB client. Sending Web cookies and
+            // SAPISIDHASH with an ANDROID client context is an invalid identity combination and
+            // YouTube rejects it with HTTP 400.
+            let requestBody = useAuthentication ? webBody : androidBody
+            let requestUserAgent = useAuthentication ? safariUserAgent : androidUserAgent
+            let clientLabel = useAuthentication ? "WEB 登录" : "Android 匿名"
             var request = URLRequest(url: endpoint)
             request.httpMethod = "POST"
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            request.setValue(requestUserAgent, forHTTPHeaderField: "User-Agent")
             request.timeoutInterval = 20
             let cookies = client.cookies
             if useAuthentication, !cookies.isEmpty {
                 request.setValue(cookies, forHTTPHeaderField: "Cookie")
                 request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+                request.setValue("https://www.youtube.com/watch?v=\(id)", forHTTPHeaderField: "Referer")
                 request.setValue("https://www.youtube.com", forHTTPHeaderField: "X-Origin")
                 request.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
+                request.setValue("1", forHTTPHeaderField: "X-YouTube-Client-Name")
+                request.setValue("2.20260810.01.00", forHTTPHeaderField: "X-YouTube-Client-Version")
+                if !client.model.visitorData.isEmpty {
+                    request.setValue(client.model.visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+                }
                 if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
                     request.setValue(authorization, forHTTPHeaderField: "Authorization")
                 }
@@ -192,14 +226,26 @@ final class VideoService: VideoServicing {
                             try? await Task.sleep(for: .milliseconds(400 * attempt))
                             continue
                         }
-                        throw NSError(domain: "FreeTubeHD", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "高清接口 HTTP \(http.statusCode)（认证=\(useAuthentication ? "是" : "否")）"])
+                        let responseDetail: String
+                        if let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let errorObject = payload["error"] as? [String: Any],
+                           let message = errorObject["message"] as? String {
+                            responseDetail = "：\(message)"
+                        } else {
+                            responseDetail = ""
+                        }
+                        throw NSError(domain: "FreeTubeHD", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "高清接口 HTTP \(http.statusCode)（\(clientLabel)）\(responseDetail)"])
                     }
                     guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                         throw NSError(domain: "FreeTubeHD", code: 6, userInfo: [NSLocalizedDescriptionKey: "高清接口返回内容无法解析"])
                     }
-                    if let status = (json["playabilityStatus"] as? [String: Any])?["status"] as? String,
+                    if let statusObject = json["playabilityStatus"] as? [String: Any],
+                       let status = statusObject["status"] as? String,
                        status != "OK" {
-                        throw NSError(domain: "FreeTubeHD", code: 2, userInfo: [NSLocalizedDescriptionKey: "高清接口要求验证（\(status)）"])
+                        let reason = statusObject["reason"] as? String
+                            ?? (statusObject["errorScreen"] as? [String: Any])?["reason"] as? String
+                            ?? "无详细原因"
+                        throw NSError(domain: "FreeTubeHD", code: 2, userInfo: [NSLocalizedDescriptionKey: "\(clientLabel)高清接口要求验证（\(status)）：\(reason)"])
                     }
                     return json
                 } catch {
@@ -279,13 +325,14 @@ final class VideoService: VideoServicing {
                 } else {
                     throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得可播放的 AAC 音源"])
                 }
-                log.info("Legacy Android auth=\(authenticated, privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public), audio=\(audioSourceLabel, privacy: .public)")
+                let streamUserAgent = authenticated ? safariUserAgent : androidUserAgent
+                log.info("HD client=\(authenticated ? "WEB-auth" : "ANDROID-anon", privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public), audio=\(audioSourceLabel, privacy: .public)")
                 return NativeAdaptiveStreams(
                     videoURL: video.url,
                     audioURL: audioURL,
                     height: video.height,
                     audioSourceLabel: audioSourceLabel,
-                    requestHeaders: ["User-Agent": userAgent]
+                    requestHeaders: ["User-Agent": streamUserAgent]
                 )
             } catch {
                 lastError = error
