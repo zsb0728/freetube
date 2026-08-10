@@ -167,6 +167,7 @@ final class VideoService: VideoServicing {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = 20
             let cookies = client.cookies
             if useAuthentication, !cookies.isEmpty {
                 request.setValue(cookies, forHTTPHeaderField: "Cookie")
@@ -177,17 +178,43 @@ final class VideoService: VideoServicing {
                     request.setValue(authorization, forHTTPHeaderField: "Authorization")
                 }
             }
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode),
-                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw NSError(domain: "FreeTubeHD", code: 1, userInfo: [NSLocalizedDescriptionKey: "高清接口 HTTP 请求失败"])
+
+            var lastTransportError: Error?
+            for attempt in 1...3 {
+                do {
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw NSError(domain: "FreeTubeHD", code: 1, userInfo: [NSLocalizedDescriptionKey: "高清接口没有返回 HTTP 响应"])
+                    }
+                    if !(200..<300).contains(http.statusCode) {
+                        let retryable = http.statusCode == 408 || http.statusCode == 429 || http.statusCode >= 500
+                        if retryable, attempt < 3 {
+                            try? await Task.sleep(for: .milliseconds(400 * attempt))
+                            continue
+                        }
+                        throw NSError(domain: "FreeTubeHD", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "高清接口 HTTP \(http.statusCode)（认证=\(useAuthentication ? "是" : "否")）"])
+                    }
+                    guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        throw NSError(domain: "FreeTubeHD", code: 6, userInfo: [NSLocalizedDescriptionKey: "高清接口返回内容无法解析"])
+                    }
+                    if let status = (json["playabilityStatus"] as? [String: Any])?["status"] as? String,
+                       status != "OK" {
+                        throw NSError(domain: "FreeTubeHD", code: 2, userInfo: [NSLocalizedDescriptionKey: "高清接口要求验证（\(status)）"])
+                    }
+                    return json
+                } catch {
+                    lastTransportError = error
+                    let nsError = error as NSError
+                    let transportFailure = nsError.domain == NSURLErrorDomain
+                    if transportFailure, attempt < 3 {
+                        try? await Task.sleep(for: .milliseconds(400 * attempt))
+                        continue
+                    }
+                    throw error
+                }
             }
-            if let status = (json["playabilityStatus"] as? [String: Any])?["status"] as? String,
-               status != "OK" {
-                throw NSError(domain: "FreeTubeHD", code: 2, userInfo: [NSLocalizedDescriptionKey: "高清接口要求验证（\(status)）"])
-            }
-            return json
+            let detail = lastTransportError.map { ($0 as NSError).localizedDescription } ?? "未知网络错误"
+            throw NSError(domain: "FreeTubeHD", code: 1, userInfo: [NSLocalizedDescriptionKey: "高清接口重试三次仍失败：\(detail)"])
         }
 
         var lastError: Error?
@@ -205,13 +232,18 @@ final class VideoService: VideoServicing {
                     guard let value = format["url"] as? String else { return nil }
                     return URL(string: value)
                 }
-                let videoCandidates: [(url: URL, height: Int)] = adaptiveFormats.compactMap { format in
-                    guard let mime = format["mimeType"] as? String,
-                          mime.lowercased().contains("video/mp4"),
+                let videoCandidates: [(url: URL, height: Int, bitrate: Int)] = adaptiveFormats.compactMap { format in
+                    guard let mime = format["mimeType"] as? String else { return nil }
+                    let normalizedMime = mime.lowercased()
+                    // MP4 is only a container. YouTube may put AV1 (`av01`) in MP4, which can
+                    // produce a ready timeline but a black surface on some iPhones. Require the
+                    // universally supported H.264 codec advertised as `avc1`.
+                    guard normalizedMime.contains("video/mp4"),
+                          normalizedMime.contains("avc1"),
                           let height = format["height"] as? Int,
                           height <= maxHeight,
                           let url = directURL(format) else { return nil }
-                    return (url, height)
+                    return (url, height, format["bitrate"] as? Int ?? 0)
                 }
                 // Prefer a muxed H.264/AAC MP4 as the hidden audio player's source. AVPlayer has
                 // broader device support for these progressive resources than for standalone
@@ -231,8 +263,10 @@ final class VideoService: VideoServicing {
                           let url = directURL(format) else { return nil }
                     return (url, format["bitrate"] as? Int ?? 0)
                 }
-                guard let video = videoCandidates.max(by: { $0.height < $1.height }) else {
-                    throw NSError(domain: "FreeTubeHD", code: 4, userInfo: [NSLocalizedDescriptionKey: "未获得 1080p/720p 视频直链"])
+                guard let video = videoCandidates.max(by: {
+                    ($0.height, $0.bitrate) < ($1.height, $1.bitrate)
+                }) else {
+                    throw NSError(domain: "FreeTubeHD", code: 4, userInfo: [NSLocalizedDescriptionKey: "未获得可解码的 H.264/avc1 高清视频直链"])
                 }
                 let audioURL: URL
                 let audioSourceLabel: String

@@ -508,10 +508,20 @@ final class PlayerStateManager {
                 case .unknown:
                     self.log.info("AVPlayerItem status: unknown")
                 case .readyToPlay:
-                    self.log.info("AVPlayerItem status: readyToPlay (duration=\(item.duration.seconds, privacy: .public)s)")
+                    self.log.info("AVPlayerItem status: readyToPlay (duration=\(item.duration.seconds, privacy: .public)s, size=\(item.presentationSize.width, privacy: .public)x\(item.presentationSize.height, privacy: .public))")
+                    if self.playbackQualityLabel.contains("原生双轨") {
+                        self.hdDiagnosticMessage = "H.264 高清视频轨已就绪（\(Int(item.presentationSize.width))×\(Int(item.presentationSize.height))），等待兼容音源"
+                    }
                 case .failed:
                     let err = item.error as NSError?
-                    self.log.error("AVPlayerItem status: FAILED domain=\(err?.domain ?? "?", privacy: .public) code=\(err?.code ?? 0, privacy: .public) info=\(String(describing: err?.userInfo), privacy: .public)")
+                    let event = item.errorLog()?.events.last
+                    let detail = err.map { "\($0.domain) \($0.code)：\($0.localizedDescription)" }
+                        ?? event.map { "\($0.errorDomain) \($0.errorStatusCode)：\($0.errorComment ?? "无说明")" }
+                        ?? "AVFoundation 未提供错误码"
+                    if self.playbackQualityLabel.contains("原生双轨") {
+                        self.hdDiagnosticMessage = "1080p H.264 视频轨播放失败：\(detail)"
+                    }
+                    self.log.error("AVPlayerItem status: FAILED \(detail, privacy: .public)")
                 @unknown default:
                     break
                 }
@@ -525,6 +535,10 @@ final class PlayerStateManager {
         ) { [weak self, weak item] _ in
             guard let entry = item?.errorLog()?.events.last else { return }
             self?.log.error("AVPlayerItem error-log: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public) comment=\(entry.errorComment ?? "", privacy: .public) URI=\(entry.uri ?? "", privacy: .public)")
+            Task { @MainActor [weak self] in
+                guard let self, self.playbackQualityLabel.contains("原生双轨") else { return }
+                self.hdDiagnosticMessage = "1080p 视频轨错误：\(entry.errorDomain) \(entry.errorStatusCode)：\(entry.errorComment ?? "无说明")"
+            }
         }
     }
 
