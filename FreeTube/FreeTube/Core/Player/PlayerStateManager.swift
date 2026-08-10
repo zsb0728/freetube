@@ -590,43 +590,21 @@ final class PlayerStateManager {
                 id: videoID,
                 maxHeight: maxHeight
             )
-            do {
-                let items = try await makeAdaptiveItems(streams)
-                return (items.video, items.audio, streams.height)
-            } catch {
-                hdDiagnosticMessage = "已获得 \(streams.height)p 直链，但远程轨道校验失败：\(error.localizedDescription)"
-                log.error("HD remote track validation failed: \(error.localizedDescription, privacy: .public)")
-                return nil
-            }
+            // Do not call AVAsset.loadTracks here. YouTube serves these URLs as remote fragmented
+            // MP4/DASH resources; on iOS, metadata inspection may fail with an opaque AVFoundation
+            // error even though AVPlayer can stream the same URL normally. Direct AVPlayerItems
+            // let the native media pipeline discover each track while buffering.
+            let videoItem = AVPlayerItem(url: streams.videoURL)
+            let audioItem = AVPlayerItem(url: streams.audioURL)
+            videoItem.preferredForwardBufferDuration = 8
+            audioItem.preferredForwardBufferDuration = 8
+            hdDiagnosticMessage = "已获得 \(streams.height)p 双轨直链，正在由原生播放器缓冲"
+            return (videoItem, audioItem, streams.height)
         } catch {
             hdDiagnosticMessage = error.localizedDescription
             log.notice("HD stream resolution failed: \(error.localizedDescription, privacy: .public)")
             return nil
         }
-    }
-
-    /// Validates each remote fragmented-MP4 independently, then gives each track to its own
-    /// `AVPlayerItem`. We deliberately do not use `AVMutableComposition`: inserting a remote DASH
-    /// track asks AVFoundation to materialize a random-access sample timeline and fails on-device,
-    /// even though the exact same URL is directly streamable by AVPlayer.
-    private func makeAdaptiveItems(
-        _ streams: NativeAdaptiveStreams
-    ) async throws -> (video: AVPlayerItem, audio: AVPlayerItem) {
-        let videoAsset = AVURLAsset(url: streams.videoURL)
-        let audioAsset = AVURLAsset(url: streams.audioURL)
-        async let videoTracks = videoAsset.loadTracks(withMediaType: .video)
-        async let audioTracks = audioAsset.loadTracks(withMediaType: .audio)
-        let resolvedVideoTracks = try await videoTracks
-        let resolvedAudioTracks = try await audioTracks
-        guard !resolvedVideoTracks.isEmpty, !resolvedAudioTracks.isEmpty else {
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        let videoItem = AVPlayerItem(asset: videoAsset)
-        let audioItem = AVPlayerItem(asset: audioAsset)
-        // A little forward buffer absorbs normal CDN jitter without downloading the full video.
-        videoItem.preferredForwardBufferDuration = 8
-        audioItem.preferredForwardBufferDuration = 8
-        return (videoItem, audioItem)
     }
 
     /// Fires `DownloadManager.ensureDownloaded` for just the next queued video, in the background.
