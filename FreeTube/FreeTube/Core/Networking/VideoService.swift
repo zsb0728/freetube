@@ -6,6 +6,10 @@ struct NativeAdaptiveStreams: Sendable {
     let videoURL: URL
     let audioURL: URL
     let height: Int
+    /// Human-readable origin of the hidden player's audio: a proven-playable muxed MP4 is
+    /// preferred, with audio-only AAC retained as fallback.
+    let audioSourceLabel: String
+    let requestHeaders: [String: String]
 }
 
 struct VideoInfo: Sendable {
@@ -192,15 +196,16 @@ final class VideoService: VideoServicing {
             do {
                 let json = try await playerJSON(useAuthentication: authenticated)
                 guard let streaming = json["streamingData"] as? [String: Any],
-                      let formats = streaming["adaptiveFormats"] as? [[String: Any]] else {
+                      let adaptiveFormats = streaming["adaptiveFormats"] as? [[String: Any]] else {
                     throw NSError(domain: "FreeTubeHD", code: 3, userInfo: [NSLocalizedDescriptionKey: "高清接口未返回自适应格式"])
                 }
+                let muxedFormats = streaming["formats"] as? [[String: Any]] ?? []
 
                 func directURL(_ format: [String: Any]) -> URL? {
                     guard let value = format["url"] as? String else { return nil }
                     return URL(string: value)
                 }
-                let videoCandidates: [(url: URL, height: Int)] = formats.compactMap { format in
+                let videoCandidates: [(url: URL, height: Int)] = adaptiveFormats.compactMap { format in
                     guard let mime = format["mimeType"] as? String,
                           mime.lowercased().contains("video/mp4"),
                           let height = format["height"] as? Int,
@@ -208,20 +213,46 @@ final class VideoService: VideoServicing {
                           let url = directURL(format) else { return nil }
                     return (url, height)
                 }
-                let audioCandidates: [(url: URL, bitrate: Int)] = formats.compactMap { format in
+                // Prefer a muxed H.264/AAC MP4 as the hidden audio player's source. AVPlayer has
+                // broader device support for these progressive resources than for standalone
+                // fragmented AAC MP4. Its picture is never displayed; the visible player remains
+                // the selected 1080p video-only stream.
+                let muxedAudioCandidates: [(url: URL, height: Int)] = muxedFormats.compactMap { format in
+                    guard let mime = format["mimeType"] as? String,
+                          mime.lowercased().contains("video/mp4"),
+                          mime.lowercased().contains("mp4a"),
+                          let url = directURL(format) else { return nil }
+                    return (url, format["height"] as? Int ?? 0)
+                }
+                let aacCandidates: [(url: URL, bitrate: Int)] = adaptiveFormats.compactMap { format in
                     guard let mime = format["mimeType"] as? String,
                           mime.lowercased().contains("audio/mp4"),
+                          mime.lowercased().contains("mp4a"),
                           let url = directURL(format) else { return nil }
                     return (url, format["bitrate"] as? Int ?? 0)
                 }
                 guard let video = videoCandidates.max(by: { $0.height < $1.height }) else {
                     throw NSError(domain: "FreeTubeHD", code: 4, userInfo: [NSLocalizedDescriptionKey: "未获得 1080p/720p 视频直链"])
                 }
-                guard let audio = audioCandidates.max(by: { $0.bitrate < $1.bitrate }) else {
-                    throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得 AAC 音频直链"])
+                let audioURL: URL
+                let audioSourceLabel: String
+                if let muxed = muxedAudioCandidates.max(by: { $0.height < $1.height }) {
+                    audioURL = muxed.url
+                    audioSourceLabel = "兼容合并 MP4 音轨"
+                } else if let aac = aacCandidates.max(by: { $0.bitrate < $1.bitrate }) {
+                    audioURL = aac.url
+                    audioSourceLabel = "独立 AAC 音轨"
+                } else {
+                    throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得可播放的 AAC 音源"])
                 }
-                log.info("Legacy Android auth=\(authenticated, privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public)")
-                return NativeAdaptiveStreams(videoURL: video.url, audioURL: audio.url, height: video.height)
+                log.info("Legacy Android auth=\(authenticated, privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public), audio=\(audioSourceLabel, privacy: .public)")
+                return NativeAdaptiveStreams(
+                    videoURL: video.url,
+                    audioURL: audioURL,
+                    height: video.height,
+                    audioSourceLabel: audioSourceLabel,
+                    requestHeaders: ["User-Agent": userAgent]
+                )
             } catch {
                 lastError = error
                 log.notice("Legacy Android HD auth=\(authenticated, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")

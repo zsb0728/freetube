@@ -414,8 +414,12 @@ final class PlayerStateManager {
                     self.startAdaptiveAudioIfReady(forceAlign: true)
                 case .failed:
                     let error = item.error as NSError?
-                    self.hdDiagnosticMessage = "1080p 视频已加载，但 AAC 播放失败：\(error?.localizedDescription ?? "未知错误")"
-                    self.log.error("Adaptive AAC item failed: \(String(describing: error), privacy: .public)")
+                    let event = item.errorLog()?.events.last
+                    let detail = error.map { "\($0.domain) \($0.code)：\($0.localizedDescription)" }
+                        ?? event.map { "\($0.errorDomain) \($0.errorStatusCode)：\($0.errorComment ?? "无说明")" }
+                        ?? "AVFoundation 未提供错误码"
+                    self.hdDiagnosticMessage = "1080p 视频已加载，但兼容音源播放失败：\(detail)"
+                    self.log.error("Adaptive audio item failed: \(detail, privacy: .public)")
                 default:
                     break
                 }
@@ -427,7 +431,10 @@ final class PlayerStateManager {
             queue: .main
         ) { [weak self, weak item] _ in
             guard let entry = item?.errorLog()?.events.last else { return }
-            self?.log.error("Adaptive AAC error: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public) comment=\(entry.errorComment ?? "", privacy: .public)")
+            self?.log.error("Adaptive audio error: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public) comment=\(entry.errorComment ?? "", privacy: .public)")
+            Task { @MainActor [weak self] in
+                self?.hdDiagnosticMessage = "兼容音源错误：\(entry.errorDomain) \(entry.errorStatusCode)：\(entry.errorComment ?? "无说明")"
+            }
         }
     }
 
@@ -611,14 +618,17 @@ final class PlayerStateManager {
                 maxHeight: maxHeight
             )
             // Do not call AVAsset.loadTracks here. YouTube serves these URLs as remote fragmented
-            // MP4/DASH resources; on iOS, metadata inspection may fail with an opaque AVFoundation
-            // error even though AVPlayer can stream the same URL normally. Direct AVPlayerItems
-            // let the native media pipeline discover each track while buffering.
-            let videoItem = AVPlayerItem(url: streams.videoURL)
-            let audioItem = AVPlayerItem(url: streams.audioURL)
+            // MP4/DASH resources; metadata inspection may fail with an opaque AVFoundation error
+            // even though AVPlayer can stream the same URL. Pass the same Android User-Agent to
+            // the CDN for both tracks — some signed URLs reject AVFoundation's default UA.
+            let options: [String: Any] = [AVURLAssetHTTPHeaderFieldsKey: streams.requestHeaders]
+            let videoAsset = AVURLAsset(url: streams.videoURL, options: options)
+            let audioAsset = AVURLAsset(url: streams.audioURL, options: options)
+            let videoItem = AVPlayerItem(asset: videoAsset)
+            let audioItem = AVPlayerItem(asset: audioAsset)
             videoItem.preferredForwardBufferDuration = 8
             audioItem.preferredForwardBufferDuration = 8
-            hdDiagnosticMessage = "已获得 \(streams.height)p 双轨直链，正在由原生播放器缓冲"
+            hdDiagnosticMessage = "已获得 \(streams.height)p 直链，音源：\(streams.audioSourceLabel)，正在由原生播放器缓冲"
             return (videoItem, audioItem, streams.height)
         } catch {
             hdDiagnosticMessage = error.localizedDescription
