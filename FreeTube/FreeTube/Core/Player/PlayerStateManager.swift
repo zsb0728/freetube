@@ -275,19 +275,12 @@ final class PlayerStateManager {
 
     func play() {
         log.info("play()")
-        let rate = player.defaultRate > 0 ? player.defaultRate : 1
-        if let audio = adaptiveAudioPlayer {
-            audio.defaultRate = rate
-            // Schedule both clocks against one host-time boundary instead of calling play() twice.
-            // This prevents the audible offset caused by independent buffering/startup latency.
-            let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
-                + CMTime(seconds: 0.12, preferredTimescale: 600)
-            player.setRate(rate, time: player.currentTime(), atHostTime: hostTime)
-            audio.setRate(rate, time: audio.currentTime(), atHostTime: hostTime)
-        } else {
-            player.play()
-        }
         isPlaying = true
+        // Let AVPlayer manage remote-DASH readiness and buffering. Scheduling an `.unknown`
+        // AVPlayerItem with `setRate(_:time:atHostTime:)` can raise an Objective-C exception inside
+        // AVFoundation, which Swift cannot catch. AAC joins only after its item reports ready.
+        player.play()
+        startAdaptiveAudioIfReady(forceAlign: true)
     }
 
     func pause() {
@@ -311,13 +304,17 @@ final class PlayerStateManager {
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                guard let audio = self.adaptiveAudioPlayer else {
+                // Seeking an `.unknown` remote AAC item can trigger an internal AVFoundation
+                // exception. If it is not ready yet, the ready callback aligns it later.
+                guard let audio = self.adaptiveAudioPlayer,
+                      audio.currentItem?.status == .readyToPlay else {
                     if shouldResume { self.play() }
                     return
                 }
-                audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                    guard let self else { return }
+                audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak audio] _ in
+                    guard let self, let audio else { return }
                     Task { @MainActor in
+                        guard self.adaptiveAudioPlayer === audio else { return }
                         if shouldResume { self.play() }
                     }
                 }
@@ -414,6 +411,7 @@ final class PlayerStateManager {
                 case .readyToPlay:
                     self.hdDiagnosticMessage = "1080p 双轨均已就绪，音画时钟同步中"
                     self.log.info("Adaptive AAC item ready")
+                    self.startAdaptiveAudioIfReady(forceAlign: true)
                 case .failed:
                     let error = item.error as NSError?
                     self.hdDiagnosticMessage = "1080p 视频已加载，但 AAC 播放失败：\(error?.localizedDescription ?? "未知错误")"
@@ -430,6 +428,26 @@ final class PlayerStateManager {
         ) { [weak self, weak item] _ in
             guard let entry = item?.errorLog()?.events.last else { return }
             self?.log.error("Adaptive AAC error: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public) comment=\(entry.errorComment ?? "", privacy: .public)")
+        }
+    }
+
+    private func startAdaptiveAudioIfReady(forceAlign: Bool) {
+        guard isPlaying,
+              let audio = adaptiveAudioPlayer,
+              let item = audio.currentItem,
+              item.status == .readyToPlay else { return }
+        if forceAlign {
+            let videoTime = player.currentTime()
+            guard videoTime.isNumeric else { return }
+            audio.seek(to: videoTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak audio] _ in
+                guard let self, let audio else { return }
+                Task { @MainActor in
+                    guard self.isPlaying, self.adaptiveAudioPlayer === audio else { return }
+                    audio.play()
+                }
+            }
+        } else {
+            audio.play()
         }
     }
 
@@ -451,6 +469,7 @@ final class PlayerStateManager {
     /// ignoring sub-120 ms differences avoids a seek storm and remains below lip-sync perception.
     private func correctAdaptiveAudioSync(force: Bool = false) {
         guard let audio = adaptiveAudioPlayer,
+              audio.currentItem?.status == .readyToPlay,
               !isCorrectingAdaptiveSync else { return }
         let videoSeconds = player.currentTime().seconds
         let audioSeconds = audio.currentTime().seconds
@@ -459,12 +478,13 @@ final class PlayerStateManager {
         guard force || drift > 0.12 else { return }
         isCorrectingAdaptiveSync = true
         let target = CMTime(seconds: videoSeconds, preferredTimescale: 600)
-        audio.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            guard let self else { return }
+        audio.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak audio] _ in
+            guard let self, let audio else { return }
             Task { @MainActor in
+                guard self.adaptiveAudioPlayer === audio else { return }
                 self.isCorrectingAdaptiveSync = false
                 if self.player.timeControlStatus == .playing {
-                    audio.rate = self.player.rate > 0 ? self.player.rate : self.player.defaultRate
+                    audio.play()
                 }
             }
         }
@@ -798,7 +818,10 @@ final class PlayerStateManager {
             guard rate > 0 else { return }
             Task { @MainActor in
                 self.adaptiveAudioPlayer?.defaultRate = newValue
-                if self.isPlaying { self.adaptiveAudioPlayer?.rate = newValue }
+                if self.isPlaying,
+                   self.adaptiveAudioPlayer?.currentItem?.status == .readyToPlay {
+                    self.adaptiveAudioPlayer?.rate = newValue
+                }
                 if abs(rate - self.preferences.playbackRate) > 0.001 {
                     self.log.info("playbackRate changed → \(rate, privacy: .public) (persisting)")
                     self.preferences.playbackRate = rate
@@ -819,8 +842,9 @@ final class PlayerStateManager {
                     // Native AVPlayerViewController controls only the visible player. Mirror its
                     // play/resume and any scrubbed position to the hidden AAC player.
                     if let audio = self.adaptiveAudioPlayer,
+                       audio.currentItem?.status == .readyToPlay,
                        audio.timeControlStatus != .playing {
-                        self.correctAdaptiveAudioSync(force: true)
+                        self.startAdaptiveAudioIfReady(forceAlign: true)
                     }
                 case .paused:
                     self.adaptiveAudioPlayer?.pause()
