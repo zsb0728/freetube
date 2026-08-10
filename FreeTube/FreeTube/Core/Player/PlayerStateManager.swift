@@ -633,6 +633,12 @@ final class PlayerStateManager {
             item = AVPlayerItem(url: local)
             playbackQualityLabel = "本地文件"
             log.info("resolveAndPlay: cache hit \(local.path, privacy: .public)")
+        } else if let streamURL = await resolveStreamingURL(
+            videoID: video.id,
+            quality: preferences.preferredQuality
+        ) {
+            item = AVPlayerItem(url: streamURL)
+            log.info("resolveAndPlay: native streaming \(streamURL.absoluteString, privacy: .public)")
         } else if let adaptiveItems = await resolveAdaptiveHDItems(
             videoID: video.id,
             maxHeight: preferences.preferredQuality.heightCap ?? 1080
@@ -642,12 +648,6 @@ final class PlayerStateManager {
             playbackQualityLabel = "\(adaptiveItems.height)p · 原生双轨"
             hdDiagnosticMessage = "已加载 \(adaptiveItems.height)p H.264 与 AAC 双原生播放器"
             log.info("resolveAndPlay: legacy Android adaptive dual-player \(adaptiveItems.height, privacy: .public)p")
-        } else if let streamURL = await resolveStreamingURL(
-            videoID: video.id,
-            quality: preferences.preferredQuality
-        ) {
-            item = AVPlayerItem(url: streamURL)
-            log.info("resolveAndPlay: native streaming \(streamURL.absoluteString, privacy: .public)")
         } else {
             log.error("resolveAndPlay: native streaming unavailable for \(video.id, privacy: .public)")
             let hasLogin = !(CookieStore.shared.loadHeader() ?? "").isEmpty
