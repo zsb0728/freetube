@@ -51,6 +51,14 @@ final class PlayerStateManager {
     /// `removeAllItems()` + `insert(_:after:)` pattern via `swap(to:)` below.
     let player = AVQueuePlayer()
 
+    /// YouTube's 720p/1080p DASH formats are split into a silent video stream and a separate AAC
+    /// stream. `AVMutableComposition` cannot insert those remote fragmented-MP4 tracks reliably,
+    /// so HD playback uses this second native player for audio and keeps it locked to `player`.
+    private var adaptiveAudioPlayer: AVPlayer?
+    private var adaptiveAudioStatusObservation: NSKeyValueObservation?
+    private var adaptiveAudioErrorLogObservation: NSObjectProtocol?
+    private var isCorrectingAdaptiveSync = false
+
     // MARK: - Collaborators
 
     let queue: QueueManager
@@ -184,6 +192,7 @@ final class PlayerStateManager {
             log.debug("load: clearing AVQueuePlayer items (\(self.player.items().count, privacy: .public) entries)")
             player.removeAllItems()
         }
+        clearAdaptiveAudio()
         currentVideo = video
         playbackQualityLabel = "Resolving…"
         hdDiagnosticMessage = "正在请求 1080p 视频与 AAC 音频轨道…"
@@ -266,13 +275,25 @@ final class PlayerStateManager {
 
     func play() {
         log.info("play()")
-        player.play()
+        let rate = player.defaultRate > 0 ? player.defaultRate : 1
+        if let audio = adaptiveAudioPlayer {
+            audio.defaultRate = rate
+            // Schedule both clocks against one host-time boundary instead of calling play() twice.
+            // This prevents the audible offset caused by independent buffering/startup latency.
+            let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
+                + CMTime(seconds: 0.12, preferredTimescale: 600)
+            player.setRate(rate, time: player.currentTime(), atHostTime: hostTime)
+            audio.setRate(rate, time: audio.currentTime(), atHostTime: hostTime)
+        } else {
+            player.play()
+        }
         isPlaying = true
     }
 
     func pause() {
         log.info("pause()")
         player.pause()
+        adaptiveAudioPlayer?.pause()
         isPlaying = false
     }
 
@@ -284,7 +305,24 @@ final class PlayerStateManager {
     func seek(to seconds: TimeInterval) {
         log.info("seek(to: \(seconds, privacy: .public)s)")
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        let shouldResume = isPlaying
+        player.pause()
+        adaptiveAudioPlayer?.pause()
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard let audio = self.adaptiveAudioPlayer else {
+                    if shouldResume { self.play() }
+                    return
+                }
+                audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        if shouldResume { self.play() }
+                    }
+                }
+            }
+        }
     }
 
     func seekRelative(by delta: TimeInterval) {
@@ -340,6 +378,7 @@ final class PlayerStateManager {
         currentVideo = nil
         loadState = .idle
         player.removeAllItems()
+        clearAdaptiveAudio()
         NowPlayingCenter.clear()
     }
 
@@ -352,12 +391,83 @@ final class PlayerStateManager {
     /// failures the moment they happen (CoreMedia's `CFByteFlume err=-12939` style messages don't
     /// surface a structured `NSError` otherwise).
     private func loadItem(_ item: AVPlayerItem) {
+        clearAdaptiveAudio()
         let url = (item.asset as? AVURLAsset)?.url.path ?? "(non-URL asset)"
         log.info("loadItem: removeAllItems + insert (asset=\(url, privacy: .public))")
         player.removeAllItems()
         player.insert(item, after: nil)
         log.debug("loadItem: queue size after insert=\(self.player.items().count, privacy: .public)")
         observe(item: item)
+    }
+
+    private func installAdaptiveAudioItem(_ item: AVPlayerItem) {
+        clearAdaptiveAudio()
+        let audio = AVPlayer(playerItem: item)
+        audio.defaultRate = player.defaultRate
+        audio.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+        adaptiveAudioPlayer = audio
+
+        adaptiveAudioStatusObservation = item.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
+            guard let self else { return }
+            Task { @MainActor in
+                switch item.status {
+                case .readyToPlay:
+                    self.hdDiagnosticMessage = "1080p 双轨均已就绪，音画时钟同步中"
+                    self.log.info("Adaptive AAC item ready")
+                case .failed:
+                    let error = item.error as NSError?
+                    self.hdDiagnosticMessage = "1080p 视频已加载，但 AAC 播放失败：\(error?.localizedDescription ?? "未知错误")"
+                    self.log.error("Adaptive AAC item failed: \(String(describing: error), privacy: .public)")
+                default:
+                    break
+                }
+            }
+        }
+        adaptiveAudioErrorLogObservation = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.newErrorLogEntryNotification,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            guard let entry = item?.errorLog()?.events.last else { return }
+            self?.log.error("Adaptive AAC error: domain=\(entry.errorDomain, privacy: .public) code=\(entry.errorStatusCode, privacy: .public) comment=\(entry.errorComment ?? "", privacy: .public)")
+        }
+    }
+
+    private func clearAdaptiveAudio() {
+        adaptiveAudioPlayer?.pause()
+        adaptiveAudioPlayer?.replaceCurrentItem(with: nil)
+        adaptiveAudioPlayer = nil
+        adaptiveAudioStatusObservation?.invalidate()
+        adaptiveAudioStatusObservation = nil
+        if let token = adaptiveAudioErrorLogObservation {
+            NotificationCenter.default.removeObserver(token)
+        }
+        adaptiveAudioErrorLogObservation = nil
+        isCorrectingAdaptiveSync = false
+    }
+
+    /// The two AVPlayers share a scheduled host-time when started, but HTTP buffering and native
+    /// scrubber gestures can still move only the video clock. Correct meaningful drift here;
+    /// ignoring sub-120 ms differences avoids a seek storm and remains below lip-sync perception.
+    private func correctAdaptiveAudioSync(force: Bool = false) {
+        guard let audio = adaptiveAudioPlayer,
+              !isCorrectingAdaptiveSync else { return }
+        let videoSeconds = player.currentTime().seconds
+        let audioSeconds = audio.currentTime().seconds
+        guard videoSeconds.isFinite, audioSeconds.isFinite else { return }
+        let drift = abs(videoSeconds - audioSeconds)
+        guard force || drift > 0.12 else { return }
+        isCorrectingAdaptiveSync = true
+        let target = CMTime(seconds: videoSeconds, preferredTimescale: 600)
+        audio.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.isCorrectingAdaptiveSync = false
+                if self.player.timeControlStatus == .playing {
+                    audio.rate = self.player.rate > 0 ? self.player.rate : self.player.defaultRate
+                }
+            }
+        }
     }
 
     private func observe(item: AVPlayerItem) {
@@ -402,18 +512,20 @@ final class PlayerStateManager {
         // Reuse an existing local download when available; otherwise resolve a native HLS or
         // progressive MP4 URL through YouTubeKit and hand it directly to AVPlayer.
         let item: AVPlayerItem
+        var adaptiveAudioItem: AVPlayerItem?
         if let local = DownloadManager.shared.localFile(for: video.id) {
             item = AVPlayerItem(url: local)
             playbackQualityLabel = "本地文件"
             log.info("resolveAndPlay: cache hit \(local.path, privacy: .public)")
-        } else if let adaptiveItem = await resolveAdaptiveHDItem(
+        } else if let adaptiveItems = await resolveAdaptiveHDItems(
             videoID: video.id,
             maxHeight: preferences.preferredQuality.heightCap ?? 1080
         ) {
-            item = adaptiveItem.item
-            playbackQualityLabel = "\(adaptiveItem.height)p · 原生自适应"
-            hdDiagnosticMessage = "成功加载 \(adaptiveItem.height)p H.264 视频轨道与 AAC 音频轨道"
-            log.info("resolveAndPlay: legacy Android adaptive \(adaptiveItem.height, privacy: .public)p")
+            item = adaptiveItems.videoItem
+            adaptiveAudioItem = adaptiveItems.audioItem
+            playbackQualityLabel = "\(adaptiveItems.height)p · 原生双轨"
+            hdDiagnosticMessage = "已加载 \(adaptiveItems.height)p H.264 与 AAC 双原生播放器"
+            log.info("resolveAndPlay: legacy Android adaptive dual-player \(adaptiveItems.height, privacy: .public)p")
         } else if let streamURL = await resolveStreamingURL(
             videoID: video.id,
             quality: preferences.preferredQuality
@@ -430,6 +542,9 @@ final class PlayerStateManager {
             return
         }
         loadItem(item)
+        if let adaptiveAudioItem {
+            installAdaptiveAudioItem(adaptiveAudioItem)
+        }
         loadState = .readyToPlay
         updateNowPlaying()
         if autoplay { play() }
@@ -466,18 +581,21 @@ final class PlayerStateManager {
         }
     }
 
-    private func resolveAdaptiveHDItem(videoID: String, maxHeight: Int) async -> (item: AVPlayerItem, height: Int)? {
+    private func resolveAdaptiveHDItems(
+        videoID: String,
+        maxHeight: Int
+    ) async -> (videoItem: AVPlayerItem, audioItem: AVPlayerItem, height: Int)? {
         do {
             let streams = try await VideoService().fetchLegacyAndroidAdaptiveStreams(
                 id: videoID,
                 maxHeight: maxHeight
             )
             do {
-                let item = try await makeAdaptiveItem(streams)
-                return (item, streams.height)
+                let items = try await makeAdaptiveItems(streams)
+                return (items.video, items.audio, streams.height)
             } catch {
-                hdDiagnosticMessage = "已获得 \(streams.height)p 直链，但 AVAsset 远程轨道合成失败：\(error.localizedDescription)"
-                log.error("HD composition failed: \(error.localizedDescription, privacy: .public)")
+                hdDiagnosticMessage = "已获得 \(streams.height)p 直链，但远程轨道校验失败：\(error.localizedDescription)"
+                log.error("HD remote track validation failed: \(error.localizedDescription, privacy: .public)")
                 return nil
             }
         } catch {
@@ -487,39 +605,28 @@ final class PlayerStateManager {
         }
     }
 
-    /// Combines remote DASH H.264 and AAC tracks in AVFoundation. Both assets stay remote and
-    /// AVPlayer performs range requests/buffering; no Python, ffmpeg, browser, or temporary file
-    /// is involved. This enables the direct 720p/1080p URLs returned by legacy Android clients.
-    private func makeAdaptiveItem(_ streams: NativeAdaptiveStreams) async throws -> AVPlayerItem {
+    /// Validates each remote fragmented-MP4 independently, then gives each track to its own
+    /// `AVPlayerItem`. We deliberately do not use `AVMutableComposition`: inserting a remote DASH
+    /// track asks AVFoundation to materialize a random-access sample timeline and fails on-device,
+    /// even though the exact same URL is directly streamable by AVPlayer.
+    private func makeAdaptiveItems(
+        _ streams: NativeAdaptiveStreams
+    ) async throws -> (video: AVPlayerItem, audio: AVPlayerItem) {
         let videoAsset = AVURLAsset(url: streams.videoURL)
         let audioAsset = AVURLAsset(url: streams.audioURL)
         async let videoTracks = videoAsset.loadTracks(withMediaType: .video)
         async let audioTracks = audioAsset.loadTracks(withMediaType: .audio)
-        async let videoDuration = videoAsset.load(.duration)
-        async let audioDuration = audioAsset.load(.duration)
-        guard let sourceVideo = try await videoTracks.first,
-              let sourceAudio = try await audioTracks.first else {
+        let resolvedVideoTracks = try await videoTracks
+        let resolvedAudioTracks = try await audioTracks
+        guard !resolvedVideoTracks.isEmpty, !resolvedAudioTracks.isEmpty else {
             throw YouTubeServiceError.streamExtractionFailed
         }
-        let duration = min(try await videoDuration, try await audioDuration)
-        guard duration.isNumeric && duration > .zero else {
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        let composition = AVMutableComposition()
-        guard let videoTrack = composition.addMutableTrack(
-            withMediaType: .video,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        ), let audioTrack = composition.addMutableTrack(
-            withMediaType: .audio,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else {
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        let range = CMTimeRange(start: .zero, duration: duration)
-        try videoTrack.insertTimeRange(range, of: sourceVideo, at: .zero)
-        try audioTrack.insertTimeRange(range, of: sourceAudio, at: .zero)
-        videoTrack.preferredTransform = sourceVideo.preferredTransform
-        return AVPlayerItem(asset: composition)
+        let videoItem = AVPlayerItem(asset: videoAsset)
+        let audioItem = AVPlayerItem(asset: audioAsset)
+        // A little forward buffer absorbs normal CDN jitter without downloading the full video.
+        videoItem.preferredForwardBufferDuration = 8
+        audioItem.preferredForwardBufferDuration = 8
+        return (videoItem, audioItem)
     }
 
     /// Fires `DownloadManager.ensureDownloaded` for just the next queued video, in the background.
@@ -676,6 +783,7 @@ final class PlayerStateManager {
                     let total = item.duration.seconds
                     if total.isFinite { self.duration = total }
                 }
+                self.correctAdaptiveAudioSync()
                 self.updateNowPlaying()
             }
         }
@@ -685,9 +793,13 @@ final class PlayerStateManager {
             forName: .AVPlayerItemDidPlayToEndTime,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             guard let self else { return }
             Task { @MainActor in
+                // The adaptive AAC player also posts this notification. Advance only when the
+                // visible/video item ends, otherwise one video could skip two queue entries.
+                guard let endedItem = notification.object as? AVPlayerItem,
+                      endedItem === self.player.currentItem else { return }
                 if self.preferences.autoplayNext { self.playNext() }
             }
         }
@@ -707,6 +819,8 @@ final class PlayerStateManager {
             // never offers as a user option. Ignore any such bogus write.
             guard rate > 0 else { return }
             Task { @MainActor in
+                self.adaptiveAudioPlayer?.defaultRate = newValue
+                if self.isPlaying { self.adaptiveAudioPlayer?.rate = newValue }
                 if abs(rate - self.preferences.playbackRate) > 0.001 {
                     self.log.info("playbackRate changed → \(rate, privacy: .public) (persisting)")
                     self.preferences.playbackRate = rate
@@ -724,12 +838,22 @@ final class PlayerStateManager {
                         self.log.info("KVO timeControlStatus → playing (sync isPlaying=true)")
                         self.isPlaying = true
                     }
+                    // Native AVPlayerViewController controls only the visible player. Mirror its
+                    // play/resume and any scrubbed position to the hidden AAC player.
+                    if let audio = self.adaptiveAudioPlayer,
+                       audio.timeControlStatus != .playing {
+                        self.correctAdaptiveAudioSync(force: true)
+                    }
                 case .paused:
+                    self.adaptiveAudioPlayer?.pause()
                     if self.isPlaying {
                         self.log.info("KVO timeControlStatus → paused (sync isPlaying=false)")
                         self.isPlaying = false
                     }
                 case .waitingToPlayAtSpecifiedRate:
+                    // Do not let AAC run ahead while the 1080p video track is buffering. The next
+                    // `.playing` transition force-aligns and resumes it.
+                    self.adaptiveAudioPlayer?.pause()
                     // Buffering / stalled. Treat as "playing" so the UI still shows pause icon,
                     // matching what the native AVPlayerViewController shows.
                     if !self.isPlaying {

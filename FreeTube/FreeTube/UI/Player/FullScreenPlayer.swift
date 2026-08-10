@@ -86,9 +86,7 @@ struct FullScreenPlayer: View {
                     VStack {
                         HStack {
                             Spacer()
-                            moreActionsMenu
-                                .padding(10)
-                                .background(.ultraThinMaterial, in: Circle())
+                            glassMoreActionsMenu
                                 .padding(.trailing, 12)
                                 .padding(.top, 10)
                         }
@@ -261,18 +259,8 @@ struct FullScreenPlayer: View {
                 metadata(video)
                 detailsSection(video: video)
                 HStack(spacing: 12) {
-                    Button {
-                        withAnimation(.snappy) { panel = .comments }
-                    } label: {
-                        Label("评论", systemImage: "text.bubble")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Button {
-                        withAnimation(.snappy) { panel = .queue }
-                    } label: {
-                        Label("接下来播放", systemImage: "list.bullet")
-                    }
-                    .buttonStyle(.bordered)
+                    panelSelectorButton(.comments, title: "评论", icon: "text.bubble")
+                    panelSelectorButton(.queue, title: "接下来播放", icon: "list.bullet")
                 }
                 .padding(.horizontal)
                 switch self.panel {
@@ -285,6 +273,51 @@ struct FullScreenPlayer: View {
             .padding(.vertical)
         }
         .scrollContentBackground(.hidden)
+    }
+
+    @ViewBuilder
+    private func panelSelectorButton(_ target: Panel, title: String, icon: String) -> some View {
+        let selected = panel == target
+        if #available(iOS 26.0, *) {
+            if selected {
+                Button {
+                    withAnimation(.snappy) { panel = target }
+                } label: {
+                    panelSelectorLabel(title: title, icon: icon)
+                }
+                .buttonStyle(.glassProminent)
+                .tint(.accentColor)
+            } else {
+                Button {
+                    withAnimation(.snappy) { panel = target }
+                } label: {
+                    panelSelectorLabel(title: title, icon: icon)
+                }
+                .buttonStyle(.glass)
+                .tint(.primary)
+            }
+        } else {
+            Button {
+                withAnimation(.snappy) { panel = target }
+            } label: {
+                panelSelectorLabel(title: title, icon: icon)
+                    .padding(.vertical, 6)
+                    .background(
+                        selected
+                            ? AnyShapeStyle(Color.accentColor.opacity(0.75))
+                            : AnyShapeStyle(.regularMaterial),
+                        in: Capsule()
+                    )
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func panelSelectorLabel(title: String, icon: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.subheadline.weight(.semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
     }
 
     /// NavigationStack rooted at `ChannelScreen`. Mounted only when `pushedChannel != nil`.
@@ -611,6 +644,22 @@ struct FullScreenPlayer: View {
     }
 
     // MARK: - More-actions menu (three dots)
+
+    /// Keep the `Menu` itself unchanged and style its label as true Liquid Glass on iOS 26.
+    /// Earlier systems retain a material circle so the deployment target stays iOS 17.
+    @ViewBuilder
+    private var glassMoreActionsMenu: some View {
+        if #available(iOS 26.0, *) {
+            moreActionsMenu
+                .buttonStyle(.glass)
+                .controlSize(.large)
+                .tint(.primary)
+        } else {
+            moreActionsMenu
+                .padding(10)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+    }
 
     @ViewBuilder
     private var moreActionsMenu: some View {

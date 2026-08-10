@@ -40,7 +40,7 @@ protocol VideoServicing: Sendable {
     func fetchInfoViaTVHTML5(id: String) async throws -> VideoInfo
     /// Raw Android InnerTube fallback. Returns a direct muxed MP4 URL without Python or WebKit.
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL
-    /// Legacy Android exposes direct DASH video+audio URLs suitable for AVMutableComposition.
+    /// Legacy Android exposes direct DASH video+audio URLs for synchronized native AVPlayers.
     func fetchLegacyAndroidAdaptiveStreams(id: String, maxHeight: Int) async throws -> NativeAdaptiveStreams
     /// Authenticated Web-Safari HLS. AVPlayer can adapt this manifest up to HD/1080p.
     func fetchAuthenticatedSafariHLSURL(id: String) async throws -> URL
@@ -140,8 +140,8 @@ final class VideoService: VideoServicing {
 
     func fetchLegacyAndroidAdaptiveStreams(id: String, maxHeight: Int) async throws -> NativeAdaptiveStreams {
         // Android 20.26.01 predates the server-ABR-only response rollout and still returns
-        // direct DASH URLs for H.264 video plus AAC audio. They are played in-process through
-        // AVMutableComposition, not downloaded, muxed, or handed to a browser.
+        // direct DASH URLs for H.264 video plus AAC audio. They are streamed by two synchronized
+        // native AVPlayers; remote fragmented MP4 cannot be inserted into AVMutableComposition.
         let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
         let userAgent = "com.google.android.youtube/20.26.01 (Linux; U; Android 11) gzip"
         let body: [String: Any] = [
