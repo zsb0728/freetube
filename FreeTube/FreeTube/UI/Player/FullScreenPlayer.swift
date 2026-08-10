@@ -260,6 +260,21 @@ struct FullScreenPlayer: View {
             VStack(alignment: .leading, spacing: 16) {
                 metadata(video)
                 detailsSection(video: video)
+                HStack(spacing: 12) {
+                    Button {
+                        withAnimation(.snappy) { panel = .comments }
+                    } label: {
+                        Label("评论", systemImage: "text.bubble")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button {
+                        withAnimation(.snappy) { panel = .queue }
+                    } label: {
+                        Label("接下来播放", systemImage: "list.bullet")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.horizontal)
                 switch self.panel {
                 case .comments:
                     CommentsSection(videoID: video.id)
@@ -638,7 +653,12 @@ struct FullScreenPlayer: View {
                         }
                     }
                 } label: {
-                    Label("Quality · \(player.playbackQualityLabel)", systemImage: "gearshape")
+                    Label("画质 · \(player.playbackQualityLabel)", systemImage: "gearshape")
+                }
+                Button {
+                    UIPasteboard.general.string = player.hdDiagnosticMessage
+                } label: {
+                    Label("高清诊断：\(player.hdDiagnosticMessage)", systemImage: "waveform.path.ecg")
                 }
                 Button {
                     if let url = watchURL(video) {

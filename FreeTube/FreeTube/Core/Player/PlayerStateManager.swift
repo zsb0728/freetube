@@ -39,6 +39,7 @@ final class PlayerStateManager {
     /// Human-readable source/quality shown by the full player. This reports the actual selected
     /// native path, not merely the user's preferred ceiling.
     private(set) var playbackQualityLabel: String = "Resolving…"
+    private(set) var hdDiagnosticMessage: String = "等待高清诊断"
     var miniPlayerVisible: Bool = false
     var fullScreenPresented: Bool = false
 
@@ -185,6 +186,7 @@ final class PlayerStateManager {
         }
         currentVideo = video
         playbackQualityLabel = "Resolving…"
+        hdDiagnosticMessage = "正在请求 1080p 视频与 AAC 音频轨道…"
         // Keep the queue coherent. Fresh taps from search/home append the video; subsequent calls
         // from `playNext()` / `playPrevious()` find it already there and just update `currentIndex`.
         queue.setCurrent(video)
@@ -404,13 +406,14 @@ final class PlayerStateManager {
             item = AVPlayerItem(url: local)
             playbackQualityLabel = "本地文件"
             log.info("resolveAndPlay: cache hit \(local.path, privacy: .public)")
-        } else if let adaptive = try? await VideoService().fetchLegacyAndroidAdaptiveStreams(
-            id: video.id,
+        } else if let adaptiveItem = await resolveAdaptiveHDItem(
+            videoID: video.id,
             maxHeight: preferences.preferredQuality.heightCap ?? 1080
-        ), let composedItem = try? await makeAdaptiveItem(adaptive) {
-            item = composedItem
-            playbackQualityLabel = "\(adaptive.height)p · 原生自适应"
-            log.info("resolveAndPlay: legacy Android adaptive \(adaptive.height, privacy: .public)p")
+        ) {
+            item = adaptiveItem.item
+            playbackQualityLabel = "\(adaptiveItem.height)p · 原生自适应"
+            hdDiagnosticMessage = "成功加载 \(adaptiveItem.height)p H.264 视频轨道与 AAC 音频轨道"
+            log.info("resolveAndPlay: legacy Android adaptive \(adaptiveItem.height, privacy: .public)p")
         } else if let streamURL = await resolveStreamingURL(
             videoID: video.id,
             quality: preferences.preferredQuality
@@ -460,6 +463,27 @@ final class PlayerStateManager {
             }
         } else {
             prefetchNextUpcoming()
+        }
+    }
+
+    private func resolveAdaptiveHDItem(videoID: String, maxHeight: Int) async -> (item: AVPlayerItem, height: Int)? {
+        do {
+            let streams = try await VideoService().fetchLegacyAndroidAdaptiveStreams(
+                id: videoID,
+                maxHeight: maxHeight
+            )
+            do {
+                let item = try await makeAdaptiveItem(streams)
+                return (item, streams.height)
+            } catch {
+                hdDiagnosticMessage = "已获得 \(streams.height)p 直链，但 AVAsset 远程轨道合成失败：\(error.localizedDescription)"
+                log.error("HD composition failed: \(error.localizedDescription, privacy: .public)")
+                return nil
+            }
+        } catch {
+            hdDiagnosticMessage = error.localizedDescription
+            log.notice("HD stream resolution failed: \(error.localizedDescription, privacy: .public)")
+            return nil
         }
     }
 

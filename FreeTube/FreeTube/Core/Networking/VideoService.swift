@@ -157,44 +157,77 @@ final class VideoService: VideoServicing {
             "contentCheckOk": true,
             "racyCheckOk": true
         ]
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode),
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let streaming = json["streamingData"] as? [String: Any],
-              let formats = streaming["adaptiveFormats"] as? [[String: Any]] else {
-            throw YouTubeServiceError.streamExtractionFailed
+        func playerJSON(useAuthentication: Bool) async throws -> [String: Any] {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "POST"
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            let cookies = client.cookies
+            if useAuthentication, !cookies.isEmpty {
+                request.setValue(cookies, forHTTPHeaderField: "Cookie")
+                request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+                request.setValue("https://www.youtube.com", forHTTPHeaderField: "X-Origin")
+                request.setValue("0", forHTTPHeaderField: "X-Goog-AuthUser")
+                if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
+                    request.setValue(authorization, forHTTPHeaderField: "Authorization")
+                }
+            }
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw NSError(domain: "FreeTubeHD", code: 1, userInfo: [NSLocalizedDescriptionKey: "高清接口 HTTP 请求失败"])
+            }
+            if let status = (json["playabilityStatus"] as? [String: Any])?["status"] as? String,
+               status != "OK" {
+                throw NSError(domain: "FreeTubeHD", code: 2, userInfo: [NSLocalizedDescriptionKey: "高清接口要求验证（\(status)）"])
+            }
+            return json
         }
 
-        func directURL(_ format: [String: Any]) -> URL? {
-            guard let value = format["url"] as? String else { return nil }
-            return URL(string: value)
+        var lastError: Error?
+        let attempts = client.cookies.isEmpty ? [false] : [false, true]
+        for authenticated in attempts {
+            do {
+                let json = try await playerJSON(useAuthentication: authenticated)
+                guard let streaming = json["streamingData"] as? [String: Any],
+                      let formats = streaming["adaptiveFormats"] as? [[String: Any]] else {
+                    throw NSError(domain: "FreeTubeHD", code: 3, userInfo: [NSLocalizedDescriptionKey: "高清接口未返回自适应格式"])
+                }
+
+                func directURL(_ format: [String: Any]) -> URL? {
+                    guard let value = format["url"] as? String else { return nil }
+                    return URL(string: value)
+                }
+                let videoCandidates: [(url: URL, height: Int)] = formats.compactMap { format in
+                    guard let mime = format["mimeType"] as? String,
+                          mime.lowercased().contains("video/mp4"),
+                          let height = format["height"] as? Int,
+                          height <= maxHeight,
+                          let url = directURL(format) else { return nil }
+                    return (url, height)
+                }
+                let audioCandidates: [(url: URL, bitrate: Int)] = formats.compactMap { format in
+                    guard let mime = format["mimeType"] as? String,
+                          mime.lowercased().contains("audio/mp4"),
+                          let url = directURL(format) else { return nil }
+                    return (url, format["bitrate"] as? Int ?? 0)
+                }
+                guard let video = videoCandidates.max(by: { $0.height < $1.height }) else {
+                    throw NSError(domain: "FreeTubeHD", code: 4, userInfo: [NSLocalizedDescriptionKey: "未获得 1080p/720p 视频直链"])
+                }
+                guard let audio = audioCandidates.max(by: { $0.bitrate < $1.bitrate }) else {
+                    throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得 AAC 音频直链"])
+                }
+                log.info("Legacy Android auth=\(authenticated, privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public)")
+                return NativeAdaptiveStreams(videoURL: video.url, audioURL: audio.url, height: video.height)
+            } catch {
+                lastError = error
+                log.notice("Legacy Android HD auth=\(authenticated, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
-        let videoCandidates: [(url: URL, height: Int)] = formats.compactMap { format in
-            guard let mime = format["mimeType"] as? String,
-                  mime.lowercased().contains("video/mp4"),
-                  let height = format["height"] as? Int,
-                  height <= maxHeight,
-                  let url = directURL(format) else { return nil }
-            return (url, height)
-        }
-        let audioCandidates: [(url: URL, bitrate: Int)] = formats.compactMap { format in
-            guard let mime = format["mimeType"] as? String,
-                  mime.lowercased().contains("audio/mp4"),
-                  let url = directURL(format) else { return nil }
-            return (url, format["bitrate"] as? Int ?? 0)
-        }
-        guard let video = videoCandidates.max(by: { $0.height < $1.height }),
-              let audio = audioCandidates.max(by: { $0.bitrate < $1.bitrate }) else {
-            throw YouTubeServiceError.streamExtractionFailed
-        }
-        log.info("Legacy Android selected native adaptive MP4 height=\(video.height, privacy: .public)")
-        return NativeAdaptiveStreams(videoURL: video.url, audioURL: audio.url, height: video.height)
+        throw lastError ?? YouTubeServiceError.streamExtractionFailed
     }
 
     func fetchAndroidProgressiveURL(id: String, maxHeight: Int) async throws -> URL {
