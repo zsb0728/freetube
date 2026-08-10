@@ -83,6 +83,17 @@ struct FullScreenPlayer: View {
                     Color.black
                     PlayerSurface(player: player.player, showsControls: true)
                     DownloadProgressOverlay(state: player.loadState)
+                    VStack {
+                        HStack {
+                            Spacer()
+                            moreActionsMenu
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .padding(.trailing, 12)
+                                .padding(.top, 10)
+                        }
+                        Spacer()
+                    }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.width * 9 / 16)
             // Pull-down-to-dismiss starting from the video surface.
@@ -531,10 +542,6 @@ struct FullScreenPlayer: View {
         // optical rhythm even across device widths instead of the previous mixed model (fixed
         // 24pt between the 5 center buttons + flexible to the side buttons).
         HStack(spacing: 0) {
-            Spacer(minLength: 0)
-
-            moreActionsMenu
-
             Spacer(minLength: 0)
 
             Button { player.playPrevious() } label: {
