@@ -325,6 +325,7 @@ final class VideoService: VideoServicing {
                 } else {
                     throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得可播放的 AAC 音源"])
                 }
+                let streamUserAgent = authenticated ? safariUserAgent : androidUserAgent
                 var streamHeaders = ["User-Agent": streamUserAgent]
                 if authenticated {
                     let cookies = client.cookies
