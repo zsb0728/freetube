@@ -633,12 +633,9 @@ final class PlayerStateManager {
             item = AVPlayerItem(url: local)
             playbackQualityLabel = "本地文件"
             log.info("resolveAndPlay: cache hit \(local.path, privacy: .public)")
-        } else if let streamURL = await resolveStreamingURL(
-            videoID: video.id,
-            quality: preferences.preferredQuality
-        ) {
-            item = AVPlayerItem(url: streamURL)
-            log.info("resolveAndPlay: native streaming \(streamURL.absoluteString, privacy: .public)")
+        } else if let hlsURL = await resolvePreferredHLSURL(videoID: video.id) {
+            item = AVPlayerItem(url: hlsURL)
+            log.info("resolveAndPlay: preferred HLS \(hlsURL.absoluteString, privacy: .public)")
         } else if let adaptiveItems = await resolveAdaptiveHDItems(
             videoID: video.id,
             maxHeight: preferences.preferredQuality.heightCap ?? 1080
@@ -648,6 +645,12 @@ final class PlayerStateManager {
             playbackQualityLabel = "\(adaptiveItems.height)p · 原生双轨"
             hdDiagnosticMessage = "已加载 \(adaptiveItems.height)p H.264 与 AAC 双原生播放器"
             log.info("resolveAndPlay: legacy Android adaptive dual-player \(adaptiveItems.height, privacy: .public)p")
+        } else if let streamURL = await resolveStreamingURL(
+            videoID: video.id,
+            quality: preferences.preferredQuality
+        ) {
+            item = AVPlayerItem(url: streamURL)
+            log.info("resolveAndPlay: native streaming fallback \(streamURL.absoluteString, privacy: .public)")
         } else {
             log.error("resolveAndPlay: native streaming unavailable for \(video.id, privacy: .public)")
             let hasLogin = !(CookieStore.shared.loadHeader() ?? "").isEmpty
@@ -771,39 +774,47 @@ final class PlayerStateManager {
     /// HLS the way it does DASH. When HLS isn't exposed (some kids/family content), the iOS
     /// client's `defaultFormats` still include direct progressive URLs that work without the
     /// player.js scrape — that's our second tier. Returns nil only when all four tiers fail.
+    /// First-stage native stream resolver used before the dual-track 1080p attempt.
+    /// It only returns HLS-based paths so a plain progressive MP4 cannot preempt the HD branch.
+    private func resolvePreferredHLSURL(videoID: String) async -> URL? {
+        let service = VideoService()
+
+        if let hls = try? await service.fetchAuthenticatedSafariHLSURL(id: videoID) {
+            playbackQualityLabel = "Adaptive HD · HLS"
+            hdDiagnosticMessage = "已获得认证 HLS 高清流，优先使用原生自适应画面"
+            return hls
+        }
+        if let info = try? await service.fetchInfo(id: videoID), let hls = info.streamingURL {
+            playbackQualityLabel = "Adaptive HLS"
+            hdDiagnosticMessage = "已获得 iOS 客户端 HLS，自适应播放中"
+            return hls
+        }
+        if let info = try? await service.fetchInfoViaTVHTML5(id: videoID), let hls = info.streamingURL {
+            playbackQualityLabel = "TVHTML5 HLS"
+            hdDiagnosticMessage = "已获得 TVHTML5 HLS，正在回退到可显示画面"
+            return hls
+        }
+        return nil
+    }
+
+    /// Post-HD fallback resolver. By the time we get here, authenticated HLS and the 1080p
+    /// dual-track path have both failed, so returning a progressive MP4 is acceptable.
     private func resolveStreamingURL(videoID: String, quality: VideoQuality) async -> URL? {
         let service = VideoService()
 
-        // Best-quality native path for signed-in/trusted sessions. YouTube's Web-Safari client
-        // can return a master HLS manifest containing HD variants; AVPlayer automatically adapts
-        // between them and honors the user's preferred peak resolution.
-        if let hls = try? await service.fetchAuthenticatedSafariHLSURL(id: videoID) {
-            playbackQualityLabel = "Adaptive HD · HLS"
-            return hls
-        }
-
-        // Fast native path. Android currently exposes a muxed H.264/AAC MP4 (itag 18) for many
-        // videos that iOS/TV clients gate behind PoToken or sign-in. Logged-in FreeTube cookies
-        // are attached by VideoService when available.
-        if let androidURL = try? await service.fetchAndroidProgressiveURL(
-            id: videoID,
-            maxHeight: quality.heightCap ?? .max
-        ) {
-            playbackQualityLabel = "360p · MP4 fallback"
-            return androidURL
-        }
-
         if let info = try? await service.fetchInfo(id: videoID) {
-            if let hls = info.streamingURL { return hls }
             logFormats(videoID: videoID, source: "IOS", formats: info.formats)
             if let progressive = Self.pickProgressiveURL(from: info.formats, maxHeight: quality.heightCap ?? .max) {
+                playbackQualityLabel = "Progressive MP4"
+                hdDiagnosticMessage = "HLS 与 1080p 双轨均失败，改用 iOS progressive MP4"
                 return progressive
             }
         }
         if let info = try? await service.fetchInfoViaTVHTML5(id: videoID) {
-            if let hls = info.streamingURL { return hls }
             logFormats(videoID: videoID, source: "TVHTML5", formats: info.formats)
             if let progressive = Self.pickProgressiveURL(from: info.formats, maxHeight: quality.heightCap ?? .max) {
+                playbackQualityLabel = "TVHTML5 MP4"
+                hdDiagnosticMessage = "原生高清不可用，改用 TVHTML5 progressive MP4"
                 return progressive
             }
         }
@@ -818,9 +829,23 @@ final class PlayerStateManager {
                 from: result.formats,
                 maxHeight: quality.heightCap ?? .max
             ) {
+                playbackQualityLabel = "Player.js MP4"
+                hdDiagnosticMessage = "高清原生流不可用，改用 player.js 解析出的 MP4"
                 return progressive
             }
         }
+
+        // Only after every HD/native path has failed do we allow the well-known low-resolution
+        // Android muxed fallback.
+        if let androidURL = try? await service.fetchAndroidProgressiveURL(
+            id: videoID,
+            maxHeight: quality.heightCap ?? .max
+        ) {
+            playbackQualityLabel = "360p · MP4 fallback"
+            hdDiagnosticMessage = "1080p/HLS 均不可用，已回退到 Android 360p 合并流"
+            return androidURL
+        }
+
         return nil
     }
 
