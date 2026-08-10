@@ -325,14 +325,24 @@ final class VideoService: VideoServicing {
                 } else {
                     throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得可播放的 AAC 音源"])
                 }
-                let streamUserAgent = authenticated ? safariUserAgent : androidUserAgent
+                var streamHeaders = ["User-Agent": streamUserAgent]
+                if authenticated {
+                    let cookies = client.cookies
+                    streamHeaders["Cookie"] = cookies
+                    streamHeaders["Origin"] = "https://www.youtube.com"
+                    streamHeaders["Referer"] = "https://www.youtube.com/watch?v=\(id)"
+                    streamHeaders["X-Goog-AuthUser"] = "0"
+                    if let authorization = client.model.generateSAPISIDHASHForCookies(cookies) {
+                        streamHeaders["Authorization"] = authorization
+                    }
+                }
                 log.info("HD client=\(authenticated ? "WEB-auth" : "ANDROID-anon", privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public), audio=\(audioSourceLabel, privacy: .public)")
                 return NativeAdaptiveStreams(
                     videoURL: video.url,
                     audioURL: audioURL,
                     height: video.height,
                     audioSourceLabel: audioSourceLabel,
-                    requestHeaders: ["User-Agent": streamUserAgent]
+                    requestHeaders: streamHeaders
                 )
             } catch {
                 lastError = error

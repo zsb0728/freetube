@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import Kingfisher
 import OSLog
+import QuartzCore
 import SwiftData
 import UIKit
 
@@ -58,6 +59,10 @@ final class PlayerStateManager {
     private var adaptiveAudioStatusObservation: NSKeyValueObservation?
     private var adaptiveAudioErrorLogObservation: NSObjectProtocol?
     private var isCorrectingAdaptiveSync = false
+    /// Watches for actual decoded video dimensions. `readyToPlay` alone can still mean a black
+    /// remote DASH timeline with no pixel output.
+    private var hdVideoOutputWatchTask: Task<Void, Never>?
+    private var hdVideoOutput: AVPlayerItemVideoOutput?
 
     // MARK: - Collaborators
 
@@ -409,7 +414,12 @@ final class PlayerStateManager {
             Task { @MainActor in
                 switch item.status {
                 case .readyToPlay:
-                    self.hdDiagnosticMessage = "1080p 双轨均已就绪，音画时钟同步中"
+                    let size = self.player.currentItem?.presentationSize ?? .zero
+                    if size.width > 0, size.height > 0 {
+                        self.hdDiagnosticMessage = "1080p H.264 画面与兼容音源均已就绪（\(Int(size.width))×\(Int(size.height))）"
+                    } else {
+                        self.hdDiagnosticMessage = "兼容音源已就绪，正在等待 1080p 视频像素输出"
+                    }
                     self.log.info("Adaptive AAC item ready")
                     self.startAdaptiveAudioIfReady(forceAlign: true)
                 case .failed:
@@ -468,7 +478,62 @@ final class PlayerStateManager {
             NotificationCenter.default.removeObserver(token)
         }
         adaptiveAudioErrorLogObservation = nil
+        hdVideoOutputWatchTask?.cancel()
+        hdVideoOutputWatchTask = nil
+        if let output = hdVideoOutput, let item = player.currentItem {
+            item.remove(output)
+        }
+        hdVideoOutput = nil
         isCorrectingAdaptiveSync = false
+    }
+
+    private func startHDVideoOutputWatch(item: AVPlayerItem, videoID: String) {
+        hdVideoOutputWatchTask?.cancel()
+        if let oldOutput = hdVideoOutput, let oldItem = player.currentItem {
+            oldItem.remove(oldOutput)
+        }
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+        item.add(output)
+        hdVideoOutput = output
+
+        hdVideoOutputWatchTask = Task { @MainActor [weak self, weak item, weak output] in
+            guard let self, let item, let output else { return }
+            // Remote DASH often needs several seconds before the first decoded frame. Require an
+            // actual pixel buffer — status/size alone can both look healthy while the surface is
+            // black because CDN authorization or decoding failed after metadata loaded.
+            for _ in 0..<24 {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard !Task.isCancelled,
+                      self.currentVideo?.id == videoID,
+                      self.player.currentItem === item else { return }
+                let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
+                if output.hasNewPixelBuffer(forItemTime: itemTime) {
+                    let size = item.presentationSize
+                    self.hdDiagnosticMessage = "1080p H.264 已输出真实画面（\(Int(size.width))×\(Int(size.height))），音画同步中"
+                    self.log.info("HD video produced decoded pixels size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
+                    return
+                }
+            }
+
+            guard self.currentVideo?.id == videoID,
+                  self.player.currentItem === item else { return }
+            self.hdDiagnosticMessage = "1080p 轨道已就绪但 12 秒内没有像素输出，正在自动切换兼容画面"
+            self.log.error("HD item ready but produced no decoded video pixels; falling back")
+            self.pause()
+            if let fallbackURL = await self.resolveStreamingURL(
+                videoID: videoID,
+                quality: self.preferences.preferredQuality
+            ) {
+                let fallbackItem = AVPlayerItem(url: fallbackURL)
+                self.loadItem(fallbackItem)
+                self.loadState = .readyToPlay
+                self.hdDiagnosticMessage = "1080p 双轨无像素输出，已自动切换至 \(self.playbackQualityLabel)"
+                self.play()
+            } else {
+                self.clearAdaptiveAudio()
+                self.loadState = .failed("1080p 轨道没有画面，兼容播放源也不可用。请复制高清诊断。")
+            }
+        }
     }
 
     /// The two AVPlayers share a scheduled host-time when started, but HTTP buffering and native
@@ -586,6 +651,7 @@ final class PlayerStateManager {
         loadItem(item)
         if let adaptiveAudioItem {
             installAdaptiveAudioItem(adaptiveAudioItem)
+            startHDVideoOutputWatch(item: item, videoID: video.id)
         }
         loadState = .readyToPlay
         updateNowPlaying()
