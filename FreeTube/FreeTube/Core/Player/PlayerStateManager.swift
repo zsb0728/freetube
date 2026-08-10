@@ -621,7 +621,9 @@ final class PlayerStateManager {
             // MP4/DASH resources; metadata inspection may fail with an opaque AVFoundation error
             // even though AVPlayer can stream the same URL. Pass the same Android User-Agent to
             // the CDN for both tracks — some signed URLs reject AVFoundation's default UA.
-            let options: [String: Any] = [AVURLAssetHTTPHeaderFieldsKey: streams.requestHeaders]
+            // `AVURLAssetHTTPHeaderFieldsKey` is an AVFoundation option-key string but is not
+            // exported as a Swift symbol in every SDK overlay, so use its documented raw value.
+            let options: [String: Any] = ["AVURLAssetHTTPHeaderFieldsKey": streams.requestHeaders]
             let videoAsset = AVURLAsset(url: streams.videoURL, options: options)
             let audioAsset = AVURLAsset(url: streams.audioURL, options: options)
             let videoItem = AVPlayerItem(asset: videoAsset)
