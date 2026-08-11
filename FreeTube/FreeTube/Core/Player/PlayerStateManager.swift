@@ -47,9 +47,6 @@ final class PlayerStateManager {
     /// native path, not merely the user's preferred ceiling.
     private(set) var playbackQualityLabel: String = "Resolving…"
     private(set) var hdDiagnosticMessage: String = "等待高清诊断"
-    /// Non-nil when native HLS is unavailable and the signed-in YouTube Web player is the only
-    /// reliable HD decoder on this device. The SwiftUI surface swaps from AVPlayer to WKWebView.
-    private(set) var webPlaybackVideoID: String?
     var miniPlayerVisible: Bool = false
     var fullScreenPresented: Bool = false
 
@@ -212,7 +209,6 @@ final class PlayerStateManager {
         }
         clearAdaptiveAudio()
         currentVideo = video
-        webPlaybackVideoID = nil
         playbackQualityLabel = "Resolving…"
         hdDiagnosticMessage = "正在请求 1080p 视频与 AAC 音频轨道…"
         // Keep the queue coherent. Fresh taps from search/home append the video; subsequent calls
@@ -392,7 +388,6 @@ final class PlayerStateManager {
         miniPlayerVisible = false
         fullScreenPresented = false
         currentVideo = nil
-        webPlaybackVideoID = nil
         loadState = .idle
         player.removeAllItems()
         clearAdaptiveAudio()
@@ -709,33 +704,20 @@ final class PlayerStateManager {
         } else if let hlsURL = await resolvePreferredHLSURL(videoID: video.id) {
             item = AVPlayerItem(url: hlsURL)
             log.info("resolveAndPlay: preferred HLS \(hlsURL.absoluteString, privacy: .public)")
-        } else if (preferences.preferredQuality.heightCap ?? 1080) >= 1080 {
-            // The authenticated remote DASH path repeatedly reaches metadata/audio-ready while
-            // rendering a permanently black video surface on real devices. Stop advertising that
-            // as playable 1080p. WKWebView uses YouTube's own MSE/decoder stack and the same signed-
-            // in cookie store, so it can negotiate a visible HD stream without our broken split-
-            // track AVPlayer path.
-            player.removeAllItems()
-            clearAdaptiveAudio()
-            webPlaybackVideoID = video.id
-            playbackQualityLabel = "Web HD · 自适应"
-            hdDiagnosticMessage = "原生 HLS 不可用，已切换 YouTube Web 高清播放器（不再使用黑屏双轨）"
-            loadState = .readyToPlay
-            isPlaying = autoplay
-            updateNowPlaying()
-            stopProgressObservation()
-            if !skipRecommendations {
-                Task { [weak self] in
-                    await self?.fillQueueWithRecommendations(for: video)
-                    await self?.prefetchNextUpcoming()
-                }
-            }
-            log.info("resolveAndPlay: switched to signed-in Web HD player")
-            return
-        } else if let adaptiveItems = await resolveAdaptiveHDItems(
-            videoID: video.id,
-            maxHeight: preferences.preferredQuality.heightCap ?? 1080
-        ) {
+        } else if (preferences.preferredQuality.heightCap ?? 1080) >= 1080,
+                  let mergedHD = await resolveLocalMergedHDFile(
+                    videoID: video.id,
+                    maxHeight: preferences.preferredQuality.heightCap ?? 1080
+                  ) {
+            item = AVPlayerItem(url: mergedHD.url)
+            playbackQualityLabel = "\(mergedHD.height)p · 本地原生合并"
+            hdDiagnosticMessage = "\(mergedHD.height)p H.264 与 AAC 已下载并在 App 内合并，正在原生播放"
+            log.info("resolveAndPlay: local merged HD file \(mergedHD.url.path, privacy: .public)")
+        } else if (preferences.preferredQuality.heightCap ?? 1080) < 1080,
+                  let adaptiveItems = await resolveAdaptiveHDItems(
+                    videoID: video.id,
+                    maxHeight: preferences.preferredQuality.heightCap ?? 1080
+                  ) {
             item = adaptiveItems.videoItem
             adaptiveAudioItem = adaptiveItems.audioItem
             adaptiveVideoLoader = adaptiveItems.videoLoader
@@ -799,6 +781,85 @@ final class PlayerStateManager {
             }
         } else {
             prefetchNextUpcoming()
+        }
+    }
+
+    private func resolveLocalMergedHDFile(
+        videoID: String,
+        maxHeight: Int
+    ) async -> (url: URL, height: Int)? {
+        do {
+            let streams = try await VideoService().fetchLegacyAndroidAdaptiveStreams(
+                id: videoID,
+                maxHeight: maxHeight
+            )
+            let cacheDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("NativeHD", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: cacheDirectory,
+                withIntermediateDirectories: true
+            )
+            let destination = cacheDirectory.appendingPathComponent("\(videoID)-\(streams.height)p.mp4")
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path),
+               let size = attributes[.size] as? NSNumber,
+               size.int64Value > 1_000_000 {
+                return (destination, streams.height)
+            }
+
+            loadState = .downloading(progress: nil, phase: "1080p video + audio")
+            hdDiagnosticMessage = "正在下载 \(streams.height)p H.264 与兼容音源，完成后在 App 内原生合并"
+
+            func download(_ url: URL, suffix: String) async throws -> URL {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 120
+                for (name, value) in streams.requestHeaders {
+                    request.setValue(value, forHTTPHeaderField: name)
+                }
+                let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+                guard let http = response as? HTTPURLResponse,
+                      (200..<300).contains(http.statusCode) else {
+                    throw YouTubeServiceError.streamExtractionFailed
+                }
+                let localURL = cacheDirectory.appendingPathComponent(".\(videoID)-\(UUID().uuidString).\(suffix)")
+                try? FileManager.default.removeItem(at: localURL)
+                try FileManager.default.moveItem(at: temporaryURL, to: localURL)
+                return localURL
+            }
+
+            async let videoDownload = download(streams.videoURL, suffix: "video.mp4")
+            async let audioDownload = download(streams.audioURL, suffix: "audio.mp4")
+            let (videoFile, audioFile) = try await (videoDownload, audioDownload)
+            defer {
+                try? FileManager.default.removeItem(at: videoFile)
+                try? FileManager.default.removeItem(at: audioFile)
+            }
+
+            loadState = .downloading(progress: nil, phase: "merging")
+            hdDiagnosticMessage = "\(streams.height)p 视频与音源已下载，正在本地无损合并"
+            let partial = cacheDirectory.appendingPathComponent(".\(videoID)-\(streams.height)p.partial.mp4")
+            try? FileManager.default.removeItem(at: partial)
+            let exit = await FFmpegRunner.shared.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                "-i", videoFile.path,
+                "-i", audioFile.path,
+                "-c", "copy",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-movflags", "+faststart",
+                partial.path
+            ])
+            guard exit == 0,
+                  FileManager.default.fileExists(atPath: partial.path) else {
+                try? FileManager.default.removeItem(at: partial)
+                throw YouTubeServiceError.streamExtractionFailed
+            }
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.moveItem(at: partial, to: destination)
+            return (destination, streams.height)
+        } catch {
+            hdDiagnosticMessage = "1080p 本地下载合并失败：\(error.localizedDescription)"
+            log.error("Local HD merge failed: \(error.localizedDescription, privacy: .public)")
+            return nil
         }
     }
 

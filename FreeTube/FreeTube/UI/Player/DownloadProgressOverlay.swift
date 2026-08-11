@@ -56,6 +56,12 @@ struct DownloadProgressOverlay: View {
     /// - "Processing video…" between phases (yt-dlp switching from video → audio, or post-download mux)
     /// - "Downloading…" as a generic fallback
     private func label(for progress: Double?, phase: String?) -> String {
+        if phase == "1080p video + audio" {
+            return "正在下载 1080p 视频与音源…"
+        }
+        if phase == "merging" {
+            return "正在本地无损合并 1080p…"
+        }
         guard let progress else { return "Processing video…" }
         let percent = Int(progress * 100)
         if let phase, phase == "video" || phase == "audio" {
