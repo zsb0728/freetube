@@ -62,6 +62,8 @@ final class PlayerStateManager {
     /// stream. `AVMutableComposition` cannot insert those remote fragmented-MP4 tracks reliably,
     /// so HD playback uses this second native player for audio and keeps it locked to `player`.
     private var adaptiveAudioPlayer: AVPlayer?
+    private var adaptiveVideoResourceLoader: HLSResourceLoaderDelegate?
+    private var adaptiveAudioResourceLoader: HLSResourceLoaderDelegate?
     private var adaptiveAudioStatusObservation: NSKeyValueObservation?
     private var adaptiveAudioErrorLogObservation: NSObjectProtocol?
     private var isCorrectingAdaptiveSync = false
@@ -480,6 +482,8 @@ final class PlayerStateManager {
         adaptiveAudioPlayer?.pause()
         adaptiveAudioPlayer?.replaceCurrentItem(with: nil)
         adaptiveAudioPlayer = nil
+        adaptiveVideoResourceLoader = nil
+        adaptiveAudioResourceLoader = nil
         adaptiveAudioStatusObservation?.invalidate()
         adaptiveAudioStatusObservation = nil
         if let token = adaptiveAudioErrorLogObservation {
@@ -496,6 +500,35 @@ final class PlayerStateManager {
         hdVideoItem = nil
         hdVideoOutput = nil
         isCorrectingAdaptiveSync = false
+    }
+
+    private func pixelBufferContainsVisibleImage(_ buffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+              let base = CVPixelBufferGetBaseAddress(buffer) else { return false }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        guard width > 0, height > 0 else { return false }
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        var visibleSamples = 0
+        var checked = 0
+        // Sample a 16×9 grid away from the extreme edges. A legitimate fade-from-black must
+        // produce several non-dark/colorful samples before it is accepted as visible video.
+        for gy in 1...9 {
+            let y = min(height - 1, gy * height / 10)
+            for gx in 1...16 {
+                let x = min(width - 1, gx * width / 17)
+                let p = bytes + y * bytesPerRow + x * 4
+                let b = Int(p[0]), g = Int(p[1]), r = Int(p[2])
+                let brightness = max(r, g, b)
+                let spread = max(r, g, b) - min(r, g, b)
+                checked += 1
+                if brightness > 20 || spread > 10 { visibleSamples += 1 }
+            }
+        }
+        return checked > 0 && visibleSamples >= 4
     }
 
     private func startHDVideoOutputWatch(item: AVPlayerItem, videoID: String) {
@@ -547,10 +580,13 @@ final class PlayerStateManager {
                       self.hdVideoItem === item else { return }
                 let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
                 var displayTime = CMTime.invalid
-                if output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil {
+                if let pixelBuffer = output.copyPixelBuffer(
+                    forItemTime: itemTime,
+                    itemTimeForDisplay: &displayTime
+                ), self.pixelBufferContainsVisibleImage(pixelBuffer) {
                     let size = item.presentationSize
-                    self.hdDiagnosticMessage = "1080p H.264 已输出真实画面（\(Int(size.width))×\(Int(size.height))），音画同步中"
-                    self.log.info("HD video produced decoded pixels at sample=\(sample, privacy: .public) size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
+                    self.hdDiagnosticMessage = "1080p H.264 已输出非黑画面（\(Int(size.width))×\(Int(size.height))），音画同步中"
+                    self.log.info("HD video produced visible pixels at sample=\(sample, privacy: .public) size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
                     return
                 }
             }
@@ -659,6 +695,8 @@ final class PlayerStateManager {
         // progressive MP4 URL through YouTubeKit and hand it directly to AVPlayer.
         let item: AVPlayerItem
         var adaptiveAudioItem: AVPlayerItem?
+        var adaptiveVideoLoader: HLSResourceLoaderDelegate?
+        var adaptiveAudioLoader: HLSResourceLoaderDelegate?
         if let local = DownloadManager.shared.localFile(for: video.id) {
             item = AVPlayerItem(url: local)
             playbackQualityLabel = "本地文件"
@@ -672,7 +710,9 @@ final class PlayerStateManager {
         ) {
             item = adaptiveItems.videoItem
             adaptiveAudioItem = adaptiveItems.audioItem
-            playbackQualityLabel = "\(adaptiveItems.height)p · 原生双轨"
+            adaptiveVideoLoader = adaptiveItems.videoLoader
+            adaptiveAudioLoader = adaptiveItems.audioLoader
+            playbackQualityLabel = "\(adaptiveItems.height)p · 认证 Range 双轨"
             hdDiagnosticMessage = "已加载 \(adaptiveItems.height)p H.264 与 AAC 双原生播放器"
             log.info("resolveAndPlay: legacy Android adaptive dual-player \(adaptiveItems.height, privacy: .public)p")
         } else if let streamURL = await resolveStreamingURL(
@@ -694,6 +734,8 @@ final class PlayerStateManager {
         loadItem(item)
         if let adaptiveAudioItem {
             installAdaptiveAudioItem(adaptiveAudioItem)
+            adaptiveVideoResourceLoader = adaptiveVideoLoader
+            adaptiveAudioResourceLoader = adaptiveAudioLoader
             startHDVideoOutputWatch(item: item, videoID: video.id)
         }
         loadState = .readyToPlay
@@ -735,27 +777,34 @@ final class PlayerStateManager {
     private func resolveAdaptiveHDItems(
         videoID: String,
         maxHeight: Int
-    ) async -> (videoItem: AVPlayerItem, audioItem: AVPlayerItem, height: Int)? {
+    ) async -> (
+        videoItem: AVPlayerItem,
+        audioItem: AVPlayerItem,
+        videoLoader: HLSResourceLoaderDelegate,
+        audioLoader: HLSResourceLoaderDelegate,
+        height: Int
+    )? {
         do {
             let streams = try await VideoService().fetchLegacyAndroidAdaptiveStreams(
                 id: videoID,
                 maxHeight: maxHeight
             )
-            // Do not call AVAsset.loadTracks here. YouTube serves these URLs as remote fragmented
-            // MP4/DASH resources; metadata inspection may fail with an opaque AVFoundation error
-            // even though AVPlayer can stream the same URL. Pass the same Android User-Agent to
-            // the CDN for both tracks — some signed URLs reject AVFoundation's default UA.
-            // `AVURLAssetHTTPHeaderFieldsKey` is an AVFoundation option-key string but is not
-            // exported as a Swift symbol in every SDK overlay, so use its documented raw value.
-            let options: [String: Any] = ["AVURLAssetHTTPHeaderFieldsKey": streams.requestHeaders]
-            let videoAsset = AVURLAsset(url: streams.videoURL, options: options)
-            let audioAsset = AVURLAsset(url: streams.audioURL, options: options)
+            guard let proxyVideoURL = HLSResourceLoaderDelegate.rewrite(streams.videoURL),
+                  let proxyAudioURL = HLSResourceLoaderDelegate.rewrite(streams.audioURL) else {
+                throw YouTubeServiceError.streamExtractionFailed
+            }
+            let videoLoader = HLSResourceLoaderDelegate(headers: streams.requestHeaders)
+            let audioLoader = HLSResourceLoaderDelegate(headers: streams.requestHeaders)
+            let videoAsset = AVURLAsset(url: proxyVideoURL)
+            let audioAsset = AVURLAsset(url: proxyAudioURL)
+            videoAsset.resourceLoader.setDelegate(videoLoader, queue: DispatchQueue(label: "FreeTube.HDVideoLoader"))
+            audioAsset.resourceLoader.setDelegate(audioLoader, queue: DispatchQueue(label: "FreeTube.HDAudioLoader"))
             let videoItem = AVPlayerItem(asset: videoAsset)
             let audioItem = AVPlayerItem(asset: audioAsset)
             videoItem.preferredForwardBufferDuration = 8
             audioItem.preferredForwardBufferDuration = 8
-            hdDiagnosticMessage = "已获得 \(streams.height)p 直链，音源：\(streams.audioSourceLabel)，正在由原生播放器缓冲"
-            return (videoItem, audioItem, streams.height)
+            hdDiagnosticMessage = "已获得 \(streams.height)p 直链，正在通过认证 Range 代理读取视频与音源"
+            return (videoItem, audioItem, videoLoader, audioLoader, streams.height)
         } catch {
             hdDiagnosticMessage = error.localizedDescription
             log.notice("HD stream resolution failed: \(error.localizedDescription, privacy: .public)")

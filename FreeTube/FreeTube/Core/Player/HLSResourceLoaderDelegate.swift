@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import OSLog
+import UniformTypeIdentifiers
 
 /// `AVAssetResourceLoaderDelegate` that proxies every HLS request (manifest + variant playlists +
 /// every .ts/.mp4 segment) through a `URLSession` we control, so we can attach a consistent
@@ -23,16 +24,21 @@ import OSLog
 final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate {
     static let customScheme = "freetubehls"
 
-    private let userAgent: String
+    private let headers: [String: String]
     private let session: URLSession
-    private let log = AppLog(subsystem: "com.leshko.freetube", category: "HLSLoader")
+    private let log = AppLog(subsystem: "com.leshko.freetube", category: "MediaResourceLoader")
 
-    init(userAgent: String) {
-        self.userAgent = userAgent
+    init(headers: [String: String]) {
+        self.headers = headers
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 20
         self.session = URLSession(configuration: config)
         super.init()
+    }
+
+    convenience init(userAgent: String) {
+        self.init(headers: ["User-Agent": userAgent])
     }
 
     /// Replaces the URL's scheme with our custom one so AVPlayer routes its requests through us.
@@ -94,7 +100,9 @@ final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate {
 
     private func handle(loadingRequest: AVAssetResourceLoadingRequest, realURL: URL) async {
         var request = URLRequest(url: realURL)
-        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        for (name, value) in headers {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         log.debug("→ GET \(realURL.absoluteString, privacy: .public)")
 
         // Honor any byte-range the player asked for. AVPlayer issues ranged GETs for media segments;
@@ -148,8 +156,16 @@ final class HLSResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate {
             }
 
             if let contentInfo = loadingRequest.contentInformationRequest {
-                contentInfo.contentType = mime
-                contentInfo.isByteRangeAccessSupported = !isPlaylist
+                if isPlaylist {
+                    contentInfo.contentType = "public.m3u-playlist"
+                } else if let uti = UTType(mimeType: mime)?.identifier {
+                    contentInfo.contentType = uti
+                } else if realURL.pathExtension.lowercased() == "mp4" {
+                    contentInfo.contentType = UTType.mpeg4Movie.identifier
+                } else {
+                    contentInfo.contentType = UTType.data.identifier
+                }
+                contentInfo.isByteRangeAccessSupported = true
                 // For ranged responses, contentLength is the FULL resource length, not the slice
                 // we just received; parse from Content-Range when present.
                 if let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
