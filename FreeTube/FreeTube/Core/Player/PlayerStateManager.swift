@@ -47,6 +47,9 @@ final class PlayerStateManager {
     /// native path, not merely the user's preferred ceiling.
     private(set) var playbackQualityLabel: String = "Resolving…"
     private(set) var hdDiagnosticMessage: String = "等待高清诊断"
+    /// Non-nil when native HLS is unavailable and the signed-in YouTube Web player is the only
+    /// reliable HD decoder on this device. The SwiftUI surface swaps from AVPlayer to WKWebView.
+    private(set) var webPlaybackVideoID: String?
     var miniPlayerVisible: Bool = false
     var fullScreenPresented: Bool = false
 
@@ -209,6 +212,7 @@ final class PlayerStateManager {
         }
         clearAdaptiveAudio()
         currentVideo = video
+        webPlaybackVideoID = nil
         playbackQualityLabel = "Resolving…"
         hdDiagnosticMessage = "正在请求 1080p 视频与 AAC 音频轨道…"
         // Keep the queue coherent. Fresh taps from search/home append the video; subsequent calls
@@ -388,6 +392,7 @@ final class PlayerStateManager {
         miniPlayerVisible = false
         fullScreenPresented = false
         currentVideo = nil
+        webPlaybackVideoID = nil
         loadState = .idle
         player.removeAllItems()
         clearAdaptiveAudio()
@@ -704,6 +709,29 @@ final class PlayerStateManager {
         } else if let hlsURL = await resolvePreferredHLSURL(videoID: video.id) {
             item = AVPlayerItem(url: hlsURL)
             log.info("resolveAndPlay: preferred HLS \(hlsURL.absoluteString, privacy: .public)")
+        } else if (preferences.preferredQuality.heightCap ?? 1080) >= 1080 {
+            // The authenticated remote DASH path repeatedly reaches metadata/audio-ready while
+            // rendering a permanently black video surface on real devices. Stop advertising that
+            // as playable 1080p. WKWebView uses YouTube's own MSE/decoder stack and the same signed-
+            // in cookie store, so it can negotiate a visible HD stream without our broken split-
+            // track AVPlayer path.
+            player.removeAllItems()
+            clearAdaptiveAudio()
+            webPlaybackVideoID = video.id
+            playbackQualityLabel = "Web HD · 自适应"
+            hdDiagnosticMessage = "原生 HLS 不可用，已切换 YouTube Web 高清播放器（不再使用黑屏双轨）"
+            loadState = .readyToPlay
+            isPlaying = autoplay
+            updateNowPlaying()
+            stopProgressObservation()
+            if !skipRecommendations {
+                Task { [weak self] in
+                    await self?.fillQueueWithRecommendations(for: video)
+                    await self?.prefetchNextUpcoming()
+                }
+            }
+            log.info("resolveAndPlay: switched to signed-in Web HD player")
+            return
         } else if let adaptiveItems = await resolveAdaptiveHDItems(
             videoID: video.id,
             maxHeight: preferences.preferredQuality.heightCap ?? 1080

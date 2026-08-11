@@ -81,7 +81,11 @@ struct FullScreenPlayer: View {
                 // item).
                 ZStack {
                     Color.black
-                    PlayerSurface(player: player.player, showsControls: true)
+                    if let webVideoID = player.webPlaybackVideoID {
+                        WebHDPlayerSurface(videoID: webVideoID)
+                    } else {
+                        PlayerSurface(player: player.player, showsControls: true)
+                    }
                     DownloadProgressOverlay(state: player.loadState)
                     VStack {
                         HStack {
