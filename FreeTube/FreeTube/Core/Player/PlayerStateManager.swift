@@ -15,6 +15,12 @@ import UIKit
 @MainActor
 @Observable
 final class PlayerStateManager {
+    private struct ResolvedFallback: Sendable {
+        let url: URL?
+        let qualityLabel: String
+        let diagnostic: String
+    }
+
     enum LoadState: Equatable {
         case idle
         case resolving
@@ -62,6 +68,8 @@ final class PlayerStateManager {
     /// Watches for actual decoded video dimensions. `readyToPlay` alone can still mean a black
     /// remote DASH timeline with no pixel output.
     private var hdVideoOutputWatchTask: Task<Void, Never>?
+    private var hdFallbackURLTask: Task<ResolvedFallback, Never>?
+    private var hdVideoItem: AVPlayerItem?
     private var hdVideoOutput: AVPlayerItemVideoOutput?
 
     // MARK: - Collaborators
@@ -480,32 +488,54 @@ final class PlayerStateManager {
         adaptiveAudioErrorLogObservation = nil
         hdVideoOutputWatchTask?.cancel()
         hdVideoOutputWatchTask = nil
-        if let output = hdVideoOutput, let item = player.currentItem {
+        hdFallbackURLTask?.cancel()
+        hdFallbackURLTask = nil
+        if let output = hdVideoOutput, let item = hdVideoItem {
             item.remove(output)
         }
+        hdVideoItem = nil
         hdVideoOutput = nil
         isCorrectingAdaptiveSync = false
     }
 
     private func startHDVideoOutputWatch(item: AVPlayerItem, videoID: String) {
         hdVideoOutputWatchTask?.cancel()
-        if let oldOutput = hdVideoOutput, let oldItem = player.currentItem {
+        hdFallbackURLTask?.cancel()
+        if let oldOutput = hdVideoOutput, let oldItem = hdVideoItem {
             oldItem.remove(oldOutput)
         }
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
         item.add(output)
+        hdVideoItem = item
         hdVideoOutput = output
+
+        // Resolve the non-DASH picture source in parallel. If the remote video-only item is
+        // metadata-ready but never decodes a frame, fallback must be immediate rather than
+        // starting another round of network requests after the timeout.
+        hdFallbackURLTask = Task { @MainActor [weak self] in
+            guard let self else {
+                return ResolvedFallback(url: nil, qualityLabel: "不可用", diagnostic: "回退任务已释放")
+            }
+            let url = await self.resolveStreamingURL(
+                videoID: videoID,
+                quality: self.preferences.preferredQuality
+            )
+            return ResolvedFallback(
+                url: url,
+                qualityLabel: self.playbackQualityLabel,
+                diagnostic: self.hdDiagnosticMessage
+            )
+        }
 
         hdVideoOutputWatchTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            // Keep the output strongly retained while polling. `readyToPlay` and
-            // `presentationSize` can both be nonzero before a CDN segment has decoded, so require
-            // an actual pixel buffer from the output pipeline.
-            for _ in 0..<24 {
+            // A decoded pixel is the only reliable success signal. Use nanosecond sleep rather
+            // than an availability-sensitive Duration overload and fail closed after 6 seconds.
+            for sample in 0..<12 {
                 do {
-                    try await Task.sleep(for: .milliseconds(500))
+                    try await Task.sleep(nanoseconds: 500_000_000)
                 } catch {
                     return
                 }
@@ -513,31 +543,31 @@ final class PlayerStateManager {
                       self.currentVideo?.id == videoID,
                       let currentItem = self.player.currentItem,
                       currentItem === item,
-                      let output = self.hdVideoOutput else { return }
+                      let output = self.hdVideoOutput,
+                      self.hdVideoItem === item else { return }
                 let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
                 var displayTime = CMTime.invalid
-                if output.hasNewPixelBuffer(forItemTime: itemTime),
-                   output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil {
+                if output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil {
                     let size = item.presentationSize
                     self.hdDiagnosticMessage = "1080p H.264 已输出真实画面（\(Int(size.width))×\(Int(size.height))），音画同步中"
-                    self.log.info("HD video produced decoded pixels size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
+                    self.log.info("HD video produced decoded pixels at sample=\(sample, privacy: .public) size=\(size.width, privacy: .public)x\(size.height, privacy: .public)")
                     return
                 }
             }
 
             guard self.currentVideo?.id == videoID,
                   self.player.currentItem === item else { return }
-            self.hdDiagnosticMessage = "1080p 轨道已就绪但 12 秒内没有像素输出，正在自动切换兼容画面"
-            self.log.error("HD item ready but produced no decoded video pixels; falling back")
+            self.hdDiagnosticMessage = "1080p 视频 6 秒内没有像素输出，正在切换可显示画面"
+            self.log.error("HD item ready but produced no decoded video pixels; using prewarmed fallback")
             self.pause()
-            if let fallbackURL = await self.resolveStreamingURL(
-                videoID: videoID,
-                quality: self.preferences.preferredQuality
-            ) {
+            let fallback = await self.hdFallbackURLTask?.value
+            guard self.currentVideo?.id == videoID else { return }
+            if let fallbackURL = fallback?.url {
                 let fallbackItem = AVPlayerItem(url: fallbackURL)
                 self.loadItem(fallbackItem)
+                self.playbackQualityLabel = fallback?.qualityLabel ?? "兼容画面"
                 self.loadState = .readyToPlay
-                self.hdDiagnosticMessage = "1080p 双轨无像素输出，已自动切换至 \(self.playbackQualityLabel)"
+                self.hdDiagnosticMessage = "1080p 无像素输出，已切换至 \(fallback?.qualityLabel ?? "兼容画面")；\(fallback?.diagnostic ?? "")"
                 self.play()
             } else {
                 self.clearAdaptiveAudio()
@@ -872,9 +902,13 @@ final class PlayerStateManager {
     /// and video-only adaptive streams would need an AVMutableComposition setup, which we skip
     /// here on purpose — this is the streaming-fallback path, not a full DASH player.
     private static func pickProgressiveURL(from formats: [VideoFormat], maxHeight: Int) -> URL? {
-        formats
+        let minimumHeight = maxHeight >= 1080 ? 720 : 0
+        return formats
             .filter { $0.containsBothTracks && $0.url != nil }
-            .filter { ($0.height ?? .max) <= maxHeight }
+            .filter {
+                let height = $0.height ?? 0
+                return height >= minimumHeight && height <= maxHeight
+            }
             .sorted { ($0.height ?? 0) > ($1.height ?? 0) }
             .first?
             .url
