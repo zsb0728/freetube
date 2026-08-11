@@ -809,25 +809,74 @@ final class PlayerStateManager {
             loadState = .downloading(progress: nil, phase: "1080p video + audio")
             hdDiagnosticMessage = "正在下载 \(streams.height)p H.264 与兼容音源，完成后在 App 内原生合并"
 
-            func download(_ url: URL, suffix: String) async throws -> URL {
+            func download(_ url: URL, suffix: String, label: String) async throws -> URL {
                 var request = URLRequest(url: url)
-                request.timeoutInterval = 120
+                request.timeoutInterval = 300
                 for (name, value) in streams.requestHeaders {
                     request.setValue(value, forHTTPHeaderField: name)
                 }
-                let (temporaryURL, response) = try await URLSession.shared.download(for: request)
-                guard let http = response as? HTTPURLResponse,
-                      (200..<300).contains(http.statusCode) else {
-                    throw YouTubeServiceError.streamExtractionFailed
-                }
+                request.setValue("bytes=0-", forHTTPHeaderField: "Range")
+                request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
                 let localURL = cacheDirectory.appendingPathComponent(".\(videoID)-\(UUID().uuidString).\(suffix)")
                 try? FileManager.default.removeItem(at: localURL)
-                try FileManager.default.moveItem(at: temporaryURL, to: localURL)
-                return localURL
+                FileManager.default.createFile(atPath: localURL.path, contents: nil)
+                guard let handle = try? FileHandle(forWritingTo: localURL) else {
+                    throw NSError(domain: "NativeHD", code: 11, userInfo: [
+                        NSLocalizedDescriptionKey: "\(label)无法创建缓存文件"
+                    ])
+                }
+                defer { try? handle.close() }
+
+                do {
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw NSError(domain: "NativeHD", code: 12, userInfo: [
+                            NSLocalizedDescriptionKey: "\(label)没有收到 HTTP 响应"
+                        ])
+                    }
+                    guard http.statusCode == 200 || http.statusCode == 206 else {
+                        throw NSError(domain: "NativeHD", code: http.statusCode, userInfo: [
+                            NSLocalizedDescriptionKey: "\(label)下载 HTTP \(http.statusCode)"
+                        ])
+                    }
+                    let expected = http.expectedContentLength
+                    var buffer = Data()
+                    buffer.reserveCapacity(65_536)
+                    var written: Int64 = 0
+                    for try await byte in bytes {
+                        try Task.checkCancellation()
+                        buffer.append(byte)
+                        if buffer.count >= 65_536 {
+                            try handle.write(contentsOf: buffer)
+                            written += Int64(buffer.count)
+                            buffer.removeAll(keepingCapacity: true)
+                        }
+                    }
+                    if !buffer.isEmpty {
+                        try handle.write(contentsOf: buffer)
+                        written += Int64(buffer.count)
+                    }
+                    try handle.synchronize()
+                    guard written > 100_000 else {
+                        throw NSError(domain: "NativeHD", code: 13, userInfo: [
+                            NSLocalizedDescriptionKey: "\(label)只下载了 \(written) 字节，响应不完整"
+                        ])
+                    }
+                    self.log.info("Native HD \(label, privacy: .public) downloaded bytes=\(written, privacy: .public) expected=\(expected, privacy: .public)")
+                    return localURL
+                } catch {
+                    try? FileManager.default.removeItem(at: localURL)
+                    let nsError = error as NSError
+                    if nsError.domain == "NativeHD" { throw error }
+                    throw NSError(domain: "NativeHD", code: nsError.code, userInfo: [
+                        NSLocalizedDescriptionKey: "\(label)下载失败：\(nsError.localizedDescription)"
+                    ])
+                }
             }
 
-            async let videoDownload = download(streams.videoURL, suffix: "video.mp4")
-            async let audioDownload = download(streams.audioURL, suffix: "audio.mp4")
+            async let videoDownload = download(streams.videoURL, suffix: "video.mp4", label: "1080p 视频")
+            async let audioDownload = download(streams.audioURL, suffix: "audio.mp4", label: "兼容音源")
             let (videoFile, audioFile) = try await (videoDownload, audioDownload)
             defer {
                 try? FileManager.default.removeItem(at: videoFile)
@@ -851,7 +900,9 @@ final class PlayerStateManager {
             guard exit == 0,
                   FileManager.default.fileExists(atPath: partial.path) else {
                 try? FileManager.default.removeItem(at: partial)
-                throw YouTubeServiceError.streamExtractionFailed
+                throw NSError(domain: "NativeHD", code: Int(exit), userInfo: [
+                    NSLocalizedDescriptionKey: "FFmpeg 本地合并失败（exit \(exit)）"
+                ])
             }
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: partial, to: destination)
