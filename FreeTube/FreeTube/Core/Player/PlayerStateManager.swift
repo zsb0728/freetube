@@ -836,8 +836,9 @@ final class PlayerStateManager {
         }
 
         // Only after every HD/native path has failed do we allow the well-known low-resolution
-        // Android muxed fallback.
-        if let androidURL = try? await service.fetchAndroidProgressiveURL(
+        // Android muxed fallback, and only when the user did not explicitly ask for 1080p.
+        if quality.heightCap ?? .max < 1080,
+           let androidURL = try? await service.fetchAndroidProgressiveURL(
             id: videoID,
             maxHeight: quality.heightCap ?? .max
         ) {
