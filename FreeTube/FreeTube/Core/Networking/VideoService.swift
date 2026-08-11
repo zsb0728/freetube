@@ -183,13 +183,54 @@ final class VideoService: VideoServicing {
             "contentCheckOk": true,
             "racyCheckOk": true
         ]
-        func playerJSON(useAuthentication: Bool) async throws -> [String: Any] {
-            // A Web login session must be presented as the WEB client. Sending Web cookies and
-            // SAPISIDHASH with an ANDROID client context is an invalid identity combination and
-            // YouTube rejects it with HTTP 400.
-            let requestBody = useAuthentication ? webBody : androidBody
-            let requestUserAgent = useAuthentication ? safariUserAgent : androidUserAgent
-            let clientLabel = useAuthentication ? "WEB 登录" : "Android 匿名"
+        let vrUserAgent = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        let vrBody: [String: Any] = [
+            "context": ["client": [
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.60.19",
+                "androidSdkVersion": 32,
+                "userAgent": vrUserAgent,
+                "osName": "Android",
+                "osVersion": "12"
+            ]],
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        let tvUserAgent = "Mozilla/5.0 (PlayStation; PlayStation 4/12.55) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+        let tvBody: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                    "clientVersion": "2.0",
+                    "clientScreen": "EMBED",
+                    "platform": "TV"
+                ],
+                "thirdParty": ["embedUrl": "https://www.youtube.com/"]
+            ],
+            "videoId": id,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        struct HDClientAttempt {
+            let label: String
+            let body: [String: Any]
+            let userAgent: String
+            let authenticated: Bool
+        }
+        let attempts: [HDClientAttempt] = [
+            HDClientAttempt(label: "Android 匿名", body: androidBody, userAgent: androidUserAgent, authenticated: false),
+            HDClientAttempt(label: "Android VR", body: vrBody, userAgent: vrUserAgent, authenticated: false),
+            HDClientAttempt(label: "TVHTML5 Embedded", body: tvBody, userAgent: tvUserAgent, authenticated: false)
+        ] + (client.cookies.isEmpty ? [] : [
+            HDClientAttempt(label: "WEB 登录", body: webBody, userAgent: safariUserAgent, authenticated: true)
+        ])
+
+        func playerJSON(attempt: HDClientAttempt) async throws -> [String: Any] {
+            let requestBody = attempt.body
+            let requestUserAgent = attempt.userAgent
+            let clientLabel = attempt.label
+            let useAuthentication = attempt.authenticated
             var request = URLRequest(url: endpoint)
             request.httpMethod = "POST"
             request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
@@ -263,11 +304,39 @@ final class VideoService: VideoServicing {
             throw NSError(domain: "FreeTubeHD", code: 1, userInfo: [NSLocalizedDescriptionKey: "高清接口重试三次仍失败：\(detail)"])
         }
 
+        func preflight(_ url: URL, headers: [String: String], label: String) async throws {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 20
+            for (name, value) in headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+            request.setValue("bytes=0-2047", forHTTPHeaderField: "Range")
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 200 || http.statusCode == 206 else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                throw NSError(domain: "FreeTubeHD", code: status, userInfo: [
+                    NSLocalizedDescriptionKey: "\(label)直链预检 HTTP \(status)"
+                ])
+            }
+            var count = 0
+            for try await _ in bytes {
+                count += 1
+                if count >= 2048 { break }
+            }
+            guard count > 0 else {
+                throw NSError(domain: "FreeTubeHD", code: 7, userInfo: [
+                    NSLocalizedDescriptionKey: "\(label)直链预检没有收到数据"
+                ])
+            }
+        }
+
         var lastError: Error?
-        let attempts = client.cookies.isEmpty ? [false] : [false, true]
-        for authenticated in attempts {
+        for attempt in attempts {
             do {
-                let json = try await playerJSON(useAuthentication: authenticated)
+                let authenticated = attempt.authenticated
+                let json = try await playerJSON(attempt: attempt)
                 guard let streaming = json["streamingData"] as? [String: Any],
                       let adaptiveFormats = streaming["adaptiveFormats"] as? [[String: Any]] else {
                     throw NSError(domain: "FreeTubeHD", code: 3, userInfo: [NSLocalizedDescriptionKey: "高清接口未返回自适应格式"])
@@ -325,7 +394,7 @@ final class VideoService: VideoServicing {
                 } else {
                     throw NSError(domain: "FreeTubeHD", code: 5, userInfo: [NSLocalizedDescriptionKey: "未获得可播放的 AAC 音源"])
                 }
-                let streamUserAgent = authenticated ? safariUserAgent : androidUserAgent
+                let streamUserAgent = attempt.userAgent
                 var streamHeaders = ["User-Agent": streamUserAgent]
                 if authenticated {
                     let cookies = client.cookies
@@ -337,7 +406,9 @@ final class VideoService: VideoServicing {
                         streamHeaders["Authorization"] = authorization
                     }
                 }
-                log.info("HD client=\(authenticated ? "WEB-auth" : "ANDROID-anon", privacy: .public) selected native adaptive MP4 height=\(video.height, privacy: .public), audio=\(audioSourceLabel, privacy: .public)")
+                try await preflight(video.url, headers: streamHeaders, label: "\(attempt.label) 视频")
+                try await preflight(audioURL, headers: streamHeaders, label: "\(attempt.label) 音源")
+                log.info("HD client=\(attempt.label, privacy: .public) preflight passed; selected adaptive MP4 height=\(video.height, privacy: .public), audio=\(audioSourceLabel, privacy: .public)")
                 return NativeAdaptiveStreams(
                     videoURL: video.url,
                     audioURL: audioURL,
@@ -347,7 +418,7 @@ final class VideoService: VideoServicing {
                 )
             } catch {
                 lastError = error
-                log.notice("Legacy Android HD auth=\(authenticated, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+                log.notice("HD client=\(attempt.label, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             }
         }
         throw lastError ?? YouTubeServiceError.streamExtractionFailed
